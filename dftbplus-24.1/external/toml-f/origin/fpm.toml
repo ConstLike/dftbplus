@@ -1,0 +1,31 @@
+name = "toml-f"
+version = "0.3.0"
+license = "Apache-2.0 OR MIT"
+maintainer = ["@awvwgk"]
+author = ["Sebastian Ehlert"]
+copyright = "2019-2022 Sebastian Ehlert"
+homepage = "https://toml-f.github.io/toml-f"
+keywords = ["toml", "io", "serde"]
+description = "TOML parser implementation for data serialization and deserialization"
+
+[library]
+source-dir = "src"
+
+[build]
+auto-tests = false
+
+[[test]]
+name = "tftest"
+source-dir = "test/unit"
+[test.dependencies]
+test-drive.git = "https://github.com/fortran-lang/test-drive.git"
+
+[[executable]]
+name = "toml2json"
+source-dir = "test/compliance"
+main = "toml2json.f90"
+
+[[executable]]
+name = "json2toml"
+source-dir = "test/compliance"
+main = "json2toml.f90"

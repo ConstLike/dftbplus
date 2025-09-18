@@ -1,0 +1,16 @@
+#Preprocessor output
+*.f90
+#Compiled objects
+*.o
+#Compiled modules
+*.mod
+#Compiled library
+*.a
+*.so
+build
+# User defined configuration
+Makefile.user
+custom.cmake
+# Test output files
+tunneling*
+

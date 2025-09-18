@@ -1,0 +1,63 @@
+= mctc-convert(1)
+:doctype: manpage
+
+== Name
+mctc-convert - Convert between supported input formats of the tool chain library
+
+
+== Synopsis
+*mctc-convert* [_options_] _input_ _output_
+
+
+== Description
+
+Read structure from input file and writes it to output file.
+The format is determined by the file extension or the format hint.
+The input structure can be read from standard input by providing - as argument.
+Similarly, the output structure can be written to standard output with - as argument.
+Standard input and standard output should be combined with a format hint option.
+
+Supported formats:
+
+- Xmol/xyz files (xyz, log)
+- Turbomole's coord, riper's periodic coord (tmol, coord)
+- DFTB+ genFormat geometry inputs as cluster, supercell or fractional (gen)
+- VASP's POSCAR/CONTCAR input files (vasp, poscar, contcar)
+- Protein Database files, only single files (pdb)
+- Connection table files, molfile (mol) and structure data format (sdf)
+- Gaussian's external program input (ein)
+- JSON input with `qcschema_molecule` or `qcschema_input` structure (json)
+- Chemical JSON input (cjson)
+- FHI-AIMS' input files (geometry.in)
+- Q-Chem molecule block inputs (qchem)
+
+
+== Options
+
+*-i, --input* _format_::
+Hint for the format of the input file
+
+*-o, --output* _format_::
+Hint for the format of the output file
+
+*--normalize*::
+Normalize all element symbols to capitalized format
+
+*--template* _file_::
+File to use as template to fill in meta data (useful to add back SDF or PDB annotions).
+Transfers lattice, periodicity, comments and format specific annotations from the template
+to the input structure.
+If the standard input, -, is provided the template structure will
+be read _before_ the input structure.
+
+*--template-format* _format_::
+Hint for the format of the template file (only used if template file name is provided)
+
+*--ignore-dot-files*::
+Do not read charge and spin from .CHRG and .UHF files
+
+*--version*::
+Print program version and exit
+
+*--help*::
+Show this help message

@@ -1,0 +1,75 @@
+[build-system]
+requires = [
+    "poetry-core@https://github.com/python-poetry/poetry-core/archive/af08f1ce720da467c9bf3d43eed3d9ebaf4ad7fb.zip",
+    "poetry-dynamic-versioning>=0.12.3",
+    "cffi",
+    "setuptools",
+]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "pymbd"
+version = "0.0.0"
+description = "Many-body dispersion library"
+authors = ["Jan Hermann <dev@jan.hermann.name>"]
+readme = "README.md"
+packages = [{ include = "pymbd", from = "src" }]
+repository = "https://github.com/libmbd/libmbd"
+documentation = "https://libmbd.github.io/pymbd"
+license = "MPL-2.0"
+include = [
+    { path = "src/mbd.h" },
+    { path = "src/pymbd/*.so", format = "wheel" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Fortran",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[tool.poetry.build]
+script = "build.py"
+generate-setup-file = false
+
+[tool.poetry.dependencies]
+python = "^3.6"
+scipy = [
+    {version = "^1", python = "3.6" },
+    {version = "^1.6", python = ">=3.7,<3.11" },
+]
+numpy = [
+    {version = "^1", python = "3.6" },
+    {version = "^1.20", python = ">=3.7,<3.11" },
+]
+cffi = "^1"
+pytest = { version = "^6", optional = true }
+mpi4py = { version = "^3", optional = true }
+
+[tool.poetry.extras]
+mpi = ["mpi4py"]
+test = ["pytest"]
+
+[tool.poetry.dev-dependencies]
+flake8 = "^4"
+flake8-bugbear = "^21"
+flake8-comprehensions = "^3"
+flake8-quotes = "^3"
+pep8-naming = "^0.12"
+black = { version = ">=22", python = "^3.7" }
+pydocstyle = "^5"
+isort = "^5"
+fprettify = { git = "https://github.com/jhrmnn/fprettify.git", rev = "fix-config-search" }
+
+[tool.poetry-dynamic-versioning]
+enable = true
+dirty = true
+pattern = '^(?P<base>\d+\.\d+\.\d+)$'
+
+[tool.black]
+target-version = ["py36"]
+skip-string-normalization = true

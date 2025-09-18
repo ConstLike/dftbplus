@@ -1,0 +1,67 @@
+# -*- makefile -*-
+############################################################################
+# System dependent Makefile options for
+# Linux, gfortran (version 4.8)
+############################################################################
+
+# Fortran 90 compiler
+FC90 = gfortran-4.8.1
+
+# Options for the Fortran 90 compiler 
+FC90OPT = -O2 -funroll-all-loops -fexceptions -fPIC
+
+# OpenMP options for the Fortran 90 compiler 
+FCOMP = -fopenmp
+
+# C compiler
+CC = gcc
+
+# Options for the C compiler
+CCOPT = -O2 -funroll-all-loops -fPIC
+
+CCOMP = -fopenmp
+
+# Function names in C for calling from Fortran (-DAdd_, -DNoChange, -DUpperCase)
+C2F_FUNCNAMES = -DAdd_
+
+# Preprocessor (leave empty, if the compiler has a built in preprocessor)
+FPP = fypp 
+
+# Options for preprocessing
+FPPOPT = -DDEBUG=$(DEBUG)
+
+# Linker
+LN = $(FC90)  
+#LN = $(CC)
+
+# Linker options
+LNOPT = #-static
+
+# Override options for different DEBUG modes
+ifeq ($(DEBUG),1)
+    FC90OPT = -g -Wall -pedantic -fbounds-check -fPIC
+    CCOPT = -g -fPIC
+endif
+ifeq ($(DEBUG),2)
+    FC90OPT = -g -Wall -pedantic -fPIC
+    CCOPT = -g -fPIC
+endif
+ifeq ($(DEBUG),3)
+    FC90OPT = -g  -Wall -pedantic -fbounds-check -fPIC
+    CCOPT = -g -fPIC
+endif
+
+# Library options in general
+
+# How to link specific libraries
+LIB_BLAS   =  -lf77blas -lcblas -latlas -lgomp -lpthread
+LIB_LAPACK =  -llapack
+
+LIBS = $(LIB_LAPACK) $(LIB_BLAS)
+
+# These are needed to avoid undefined references in shared lib
+# for cpython interface
+EXTRALIBS = -lstdc++
+
+# Threaded version may work as well (BE CAREFUL!)
+#LIB_BLAS = -lptf77blas -lptcblas -latlas -lgomp -lpthread

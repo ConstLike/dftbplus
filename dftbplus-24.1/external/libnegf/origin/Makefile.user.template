@@ -1,0 +1,26 @@
+# -*- makefile -*-
+############################################################################
+# Local makefile settings
+#
+# This is the place for including your system dependent makefile and
+# for overriding the settings in that or the default settings.
+#
+# You must rename this file to Makefile.user
+#
+#############################################################################
+
+# Set your architecture. Make sure, that 'sysmakes/make.$(ARCH)' exists for
+# you architecture. If not, create your own using 'sysmakes/make.generic'
+# as template.
+ARCH1= $(shell uname -m)
+ARCH = $(ARCH1)-linux-gfortran
+
+DEBUG=2
+# Include system specific settings
+include $(ROOT)/sysmakes/make.$(ARCH)
+
+FPPFLAGS+=-DMPI=Y
+INCLUDE=-I../ext_mpifx/src -I../ext_fftw/include
+############################################################################
+# Overriding standard options:
+############################################################################
