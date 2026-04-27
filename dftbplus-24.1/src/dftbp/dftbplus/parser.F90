@@ -1508,6 +1508,160 @@ contains
         ctrl%isNonAufbau = .false.
       end if
 
+      ! --- DeltaSCF level-shifting block ---
+      call getChild(node, "DeltaSCF", child, requested=.false.)
+      if (associated(child)) then
+        ctrl%tDeltaScf = .true.
+
+        ! Mutually exclusive: ShiftEnergy (fixed eta) or ShiftMargin (adaptive)
+        call getChild(child, "ShiftEnergy", child2, requested=.false.)
+        if (associated(child2)) then
+          ctrl%deltaScfIsFixedEta = .true.
+          call getChildValue(child, "ShiftEnergy", ctrl%deltaScfShiftEnergy)
+          call getChild(child, "ShiftMargin", child3, requested=.false.)
+          if (associated(child3)) then
+            call detailedError(child, "DeltaSCF: specify either ShiftEnergy or ShiftMargin, not both.")
+          end if
+        else
+          call getChild(child, "ShiftMargin", child2, requested=.false.)
+          if (associated(child2)) then
+            ctrl%deltaScfIsFixedEta = .false.
+            call getChildValue(child, "ShiftMargin", ctrl%deltaScfShiftMargin, 0.1_dp)
+          else
+            call detailedError(child, "DeltaSCF: must specify either ShiftEnergy or ShiftMargin.")
+          end if
+        end if
+
+        call getChildValue(child, "UseIMOM", ctrl%deltaScfUseIMOM, .true.)
+        ! UseMixer: controls the Broyden charge mixer inside the pre-SOSCF
+        ! level-shifting Delta-SCF loop.
+        !   .false. (default) — direct substitution q_in := q_out (current behavior)
+        !   .true.            — Broyden/DIIS mixing
+        call getChildValue(child, "UseMixer", ctrl%deltaScfUseMixer, .false.)
+
+        ! ExcitedFrom_alpha and ExcitedTo_alpha are required
+        call init(li)
+        call getChildValue(child, "ExcitedFrom_alpha", li)
+        allocate(ctrl%deltaScfExcitedFrom_alpha(len(li)))
+        call asArray(li, ctrl%deltaScfExcitedFrom_alpha)
+        call destruct(li)
+
+        call init(li)
+        call getChildValue(child, "ExcitedTo_alpha", li)
+        allocate(ctrl%deltaScfExcitedTo_alpha(len(li)))
+        call asArray(li, ctrl%deltaScfExcitedTo_alpha)
+        call destruct(li)
+
+        if (size(ctrl%deltaScfExcitedFrom_alpha) /= size(ctrl%deltaScfExcitedTo_alpha)) then
+          call detailedError(child, "DeltaSCF: ExcitedFrom_alpha and ExcitedTo_alpha must have the same number of entries.")
+        end if
+
+        ! ExcitedFrom_beta and ExcitedTo_beta are optional (but must appear together)
+        call getChild(child, "ExcitedFrom_beta", child2, requested=.false.)
+        if (associated(child2)) then
+          call init(li)
+          call getChildValue(child, "ExcitedFrom_beta", li)
+          allocate(ctrl%deltaScfExcitedFrom_beta(len(li)))
+          call asArray(li, ctrl%deltaScfExcitedFrom_beta)
+          call destruct(li)
+
+          call init(li)
+          call getChildValue(child, "ExcitedTo_beta", li)
+          allocate(ctrl%deltaScfExcitedTo_beta(len(li)))
+          call asArray(li, ctrl%deltaScfExcitedTo_beta)
+          call destruct(li)
+
+          if (size(ctrl%deltaScfExcitedFrom_beta) /= size(ctrl%deltaScfExcitedTo_beta)) then
+            call detailedError(child, "DeltaSCF: ExcitedFrom_beta and ExcitedTo_beta must have the same number of entries.")
+          end if
+        else
+          ! Check ExcitedTo_beta is also absent
+          call getChild(child, "ExcitedTo_beta", child2, requested=.false.)
+          if (associated(child2)) then
+            call detailedError(child, "DeltaSCF: ExcitedTo_beta specified without ExcitedFrom_beta.")
+          end if
+        end if
+
+      else
+        ctrl%tDeltaScf = .false.
+      end if
+      ! --- End DeltaSCF ---
+
+      ! --- SOSCF block ---
+      call getChild(node, "SOSCF", child, requested=.false.)
+      if (associated(child)) then
+        ctrl%tSoscf = .true.
+
+        call getChildValue(child, "Threshold", ctrl%soscfThreshold, 1.0e-4_dp)
+        ! Charge convergence criterion for the SOSCF outer loop.
+        call getChildValue(child, "OuterSCCTolerance", ctrl%soscfOuterSccTol, 1.0e-8_dp)
+        call getChildValue(child, "Verbosity", ctrl%soscfVerbose, .false.)
+        ! UseMixer: controls the Broyden/DIIS charge mixer inside the SOSCF outer loop.
+        !   .true.  (default) — Broyden/DIIS mixer is used
+        !   .false.           — direct substitution q_in := q_out
+        call getChildValue(child, "UseMixer", ctrl%soscfUseMixer, .false.)
+        ! UseMaxKappa + MaxKappa: trust-region clip on the orbital rotation step.
+        !   UseMaxKappa = .true.  (default) : if max|Dx| > MaxKappa after the
+        !     Newton step, Dx is rescaled so max|Dx| = MaxKappa, preserving the
+        !     step direction.  Essential for high-order saddles (double
+        !     excitations, non-adjacent multi-orbital excitations) where the
+        !     unconstrained Newton step can exceed 1 rad and cause divergence.
+        !   UseMaxKappa = .false.           : no trust-region clipping.
+        !   MaxKappa    = 0.5 rad (default) : cap magnitude in radians.  The Cayley
+        !     linearisation stays accurate out to ~0.7 rad; 0.5 is conservative.
+        call getChildValue(child, "UseMaxKappa", ctrl%soscfUseMaxKappa, .true.)
+        call getChildValue(child, "MaxKappa",    ctrl%soscfMaxKappa,    0.5_dp)
+
+        ! ExcitedFrom_alpha (required)
+        call init(li)
+        call getChildValue(child, "ExcitedFrom_alpha", li)
+        allocate(ctrl%soscfExcitedFrom_alpha(len(li)))
+        call asArray(li, ctrl%soscfExcitedFrom_alpha)
+        call destruct(li)
+
+        ! ExcitedTo_alpha (required)
+        call init(li)
+        call getChildValue(child, "ExcitedTo_alpha", li)
+        allocate(ctrl%soscfExcitedTo_alpha(len(li)))
+        call asArray(li, ctrl%soscfExcitedTo_alpha)
+        call destruct(li)
+
+        if (size(ctrl%soscfExcitedFrom_alpha) /= size(ctrl%soscfExcitedTo_alpha)) then
+          call detailedError(child, "SOSCF: ExcitedFrom_alpha and ExcitedTo_alpha must &
+              &have the same number of entries.")
+        end if
+
+        ! ExcitedFrom_beta / ExcitedTo_beta (optional, must appear together)
+        call getChild(child, "ExcitedFrom_beta", child2, requested=.false.)
+        if (associated(child2)) then
+          call init(li)
+          call getChildValue(child, "ExcitedFrom_beta", li)
+          allocate(ctrl%soscfExcitedFrom_beta(len(li)))
+          call asArray(li, ctrl%soscfExcitedFrom_beta)
+          call destruct(li)
+
+          call init(li)
+          call getChildValue(child, "ExcitedTo_beta", li)
+          allocate(ctrl%soscfExcitedTo_beta(len(li)))
+          call asArray(li, ctrl%soscfExcitedTo_beta)
+          call destruct(li)
+
+          if (size(ctrl%soscfExcitedFrom_beta) /= size(ctrl%soscfExcitedTo_beta)) then
+            call detailedError(child, "SOSCF: ExcitedFrom_beta and ExcitedTo_beta must &
+                &have the same number of entries.")
+          end if
+        else
+          call getChild(child, "ExcitedTo_beta", child2, requested=.false.)
+          if (associated(child2)) then
+            call detailedError(child, "SOSCF: ExcitedTo_beta specified without ExcitedFrom_beta.")
+          end if
+        end if
+
+      else
+        ctrl%tSoscf = .false.
+      end if
+      ! --- End SOSCF ---
+
     end if ifSCC
 
     ! Customize the reference atomic charges for virtual doping

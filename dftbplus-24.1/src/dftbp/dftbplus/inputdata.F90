@@ -137,6 +137,91 @@ module dftbp_dftbplus_inputdata
     !> l-shell resolved SCC
     logical :: tShellResolved = .false.
 
+    ! --- DeltaSCF (level-shifting) settings ---
+
+    !> Enable Delta-SCF loop with level shifting
+    logical :: tDeltaScf = .false.
+
+    !> Use fixed level-shift energy (True) or adaptive based on HOMO-LUMO gap (False)
+    logical :: deltaScfIsFixedEta = .false.
+
+    !> Fixed level-shift energy eta (Hartree), used when deltaScfIsFixedEta = .true.
+    real(dp) :: deltaScfShiftEnergy = 0.0_dp
+
+    !> Margin added to HOMO-LUMO gap for adaptive eta: eta = |gap| + margin
+    real(dp) :: deltaScfShiftMargin = 0.1_dp
+
+    !> Pass charges through standard mixer during Delta-SCF loop
+    logical :: deltaScfUseMixer = .false.
+
+    !> Use IMOM (Initial Maximum Overlap Method) for orbital tracking
+    logical :: deltaScfUseIMOM = .true.
+
+    !> Alpha-spin orbital indices to depopulate (ground-state occupied -> excited virtual)
+    integer, allocatable :: deltaScfExcitedFrom_alpha(:)
+
+    !> Alpha-spin orbital indices to populate (ground-state virtual -> excited occupied)
+    integer, allocatable :: deltaScfExcitedTo_alpha(:)
+
+    !> Beta-spin orbital indices to depopulate
+    integer, allocatable :: deltaScfExcitedFrom_beta(:)
+
+    !> Beta-spin orbital indices to populate
+    integer, allocatable :: deltaScfExcitedTo_beta(:)
+
+    ! --- End DeltaSCF settings ---
+
+    ! --- SOSCF (Second-Order SCF, orbital rotation) settings ---
+
+    !> Enable SOSCF loop after the Delta-SCF pre-convergence phase
+    logical :: tSoscf = .false.
+
+    !> Orbital gradient threshold for entering SOSCF (and for final convergence).
+    !! Pre-SOSCF (Delta-SCF) runs until max|g| falls below this value.
+    real(dp) :: soscfThreshold = 1.0e-4_dp
+
+    !> SCC charge tolerance for the SOSCF outer convergence check.
+    !! Compared against max|qOut - qIn| after each orbital rotation.
+    real(dp) :: soscfOuterSccTol = 1.0e-8_dp
+
+    !> Verbose SOSCF output: print max|g| per spin in pre-SOSCF loop and
+    !! occ/virt eigenvalues + eigenvector coefficients at every SCF cycle.
+    logical :: soscfVerbose = .false.
+
+    !> Use Broyden/DIIS mixer inside the SOSCF outer loop (.true.) or
+    !! use direct substitution q_in := q_out (.false., default).
+    logical :: soscfUseMixer = .false.
+
+    !> Trust-region clip on the orbital rotation step (.true., default).
+    !! When active, if max|Dx| > soscfMaxKappa after the Newton step, Dx is
+    !! rescaled to max|Dx| = soscfMaxKappa, preserving the step direction.
+    logical :: soscfUseMaxKappa = .true.
+
+    !> Trust-region cap on max|Dx| in radians (default 0.5 rad ~ 29 deg).
+    !! Only meaningful when soscfUseMaxKappa = .true.
+    !!
+    !! 0.5 rad leaves well-behaved cases (HOMO-LUMO, moderate multi-saddle)
+    !! untouched and only activates on pathological ~1 rad first steps from
+    !! high-order saddles.  For difficult double excitations where 0.5 fails
+    !! to converge, tighten to 0.2 rad (still prevents the catastrophic blow-up
+    !! and slowly converges); tightening below 0.2 can variationally collapse
+    !! into lower-lying stationary points.
+    real(dp) :: soscfMaxKappa = 0.5_dp
+
+    !> Alpha-spin orbital indices to depopulate (same convention as DeltaSCF)
+    integer, allocatable :: soscfExcitedFrom_alpha(:)
+
+    !> Alpha-spin orbital indices to populate
+    integer, allocatable :: soscfExcitedTo_alpha(:)
+
+    !> Beta-spin orbital indices to depopulate (optional)
+    integer, allocatable :: soscfExcitedFrom_beta(:)
+
+    !> Beta-spin orbital indices to populate (optional)
+    integer, allocatable :: soscfExcitedTo_beta(:)
+
+    ! --- End SOSCF settings ---
+
     !> SCC tolerance
     real(dp) :: sccTol = 0.0_dp
 
