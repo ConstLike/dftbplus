@@ -1,0 +1,25 @@
+# Build artifacts
+_build/
+build/
+*.mod
+*.o
+*.a
+
+# Claude Code session data
+.claude/
+
+# Machine-local helper scripts (contain absolute paths)
+/compile.sh
+dftbplus-24.1/compile.sh
+
+# Reference papers (not for VCS — copyright)
+papers/
+
+# Compiled binaries and install prefix
+for_binary/
+
+# Large local test sets (1.6 GB)
+testset/
+
+# Local sandbox / scratch
+h2o_deltascf/
