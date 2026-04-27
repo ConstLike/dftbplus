@@ -51,6 +51,7 @@ set(sources-fpp
   ${curdir}/sk.F90
   ${curdir}/slakocont.F90
   ${curdir}/slakoeqgrid.F90
+  ${curdir}/soscf.F90
   ${curdir}/sparse2dense.F90
   ${curdir}/spin.F90
   ${curdir}/spinorbit.F90
