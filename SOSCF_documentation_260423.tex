@@ -1,0 +1,1449 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{braket}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=2.5cm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+% Code listings style
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{codekeyword}{rgb}{0.0,0.3,0.7}
+\definecolor{codecomment}{rgb}{0.3,0.5,0.3}
+\definecolor{codestring}{rgb}{0.6,0.2,0.2}
+
+\lstdefinelanguage{Fortran08}{
+  morekeywords={subroutine,end,function,module,use,implicit,none,real,integer,logical,
+                type,class,intent,in,out,inout,allocatable,allocate,deallocate,if,then,
+                else,elseif,endif,do,while,call,return,parameter,contains,public,private,
+                optional,dimension,target,pointer,associate,block,exit,cycle,select,case,
+                true,false,dp,only},
+  keywordstyle=\color{codekeyword}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  morecomment=[l]{!},
+  morestring=[b]",
+  morestring=[b]',
+  sensitive=false,
+}
+
+\lstdefinestyle{hsd}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  commentstyle=\color{codecomment}\itshape,
+  morecomment=[l]{\#},
+  frame=single,
+  breaklines=true,
+  columns=flexible,
+}
+
+\lstdefinestyle{fortran}{
+  language=Fortran08,
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  breaklines=true,
+  columns=flexible,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+}
+
+% Short commands
+\newcommand{\kkappa}{\bm{\kappa}}
+\newcommand{\xx}{\mathbf{x}}
+\newcommand{\gg}{\mathbf{g}}
+\newcommand{\HH}{\mathbf{H}}
+\newcommand{\FF}{\mathbf{F}}
+\newcommand{\CC}{\mathbf{C}}
+\newcommand{\UU}{\mathbf{U}}
+\newcommand{\Pp}{\mathbf{P}}
+\newcommand{\II}{\mathbf{I}}
+\newcommand{\SS}{\mathbf{S}}
+\newcommand{\qq}{\mathbf{q}}
+\DeclareMathOperator{\tr}{tr}
+
+\title{\textbf{Second-Order SCF (SOSCF) for Excited-State Orbital\\
+Optimisation in DFTB+:\\ Implementation Notes}}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document describes a second-order SCF (SOSCF) implementation for
+non-aufbau excited-state optimisation added to DFTB+ 24.1. The algorithm
+combines (i) a level-shifted \emph{pre-SOSCF} Delta-SCF loop (STEP) that
+drives the orbital gradient below a handoff threshold, with (ii) a
+quasi-Newton orbital-rotation outer loop using the L-SR1 Hessian update
+and the Cayley approximant of the matrix exponential.
+Initial Maximum Overlap Method (IMOM) tracks orbital character, and a
+trust-region step cap on the orbital rotation angle stabilises high-order
+excited-state saddles (e.g.\ double excitations).
+The text is organised as:
+(\S\ref{sec:background}) mathematical background,
+(\S\ref{sec:algorithm}) the full SOSCF workflow,
+(\S\ref{sec:implementation}) the DFTB+ variables, subroutines, input
+keywords, and output files that were added.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+\hrule
+\bigskip
+
+%=====================================================================
+\section{Introduction and motivation}
+
+Ground-state SCF in DFTB+ is solved by self-consistent charge (SCC)
+iteration with Broyden/DIIS charge mixing. For \emph{excited states}
+at the mean-field level one wants a specific \emph{non-aufbau} orbital
+occupation --- e.g.\ HOMO $\to$ LUMO --- to be the self-consistent
+solution. At such a stationary point the orbital Hessian has one or
+more negative eigenvalues (the target is a saddle, not a minimum), so
+first-order SCF methods generically fail: simple mixing collapses into
+the ground state, because descent along a negative-Hessian direction
+\emph{is} the ground-state direction.
+
+Two ideas solve this:
+\begin{enumerate}[label=(\arabic*),leftmargin=*]
+\item \textbf{Level-shifted Delta-SCF (STEP)} gives a warm start that
+lives near the desired saddle by artificially shifting the
+``to-be-virtual'' orbital eigenvalues so that the aufbau principle on
+the shifted spectrum picks the target filling.
+\item \textbf{Second-order SCF (SOSCF)}, a quasi-Newton method on the
+manifold of orbital rotations, converges the excited state tightly by
+taking Newton steps with a \emph{signed} inverse Hessian, which points
+toward saddles by construction.
+\end{enumerate}
+Neither alone is sufficient: STEP is only contractive near its
+artificial fixed point and cannot converge a saddle tightly, while
+SOSCF diverges from a poor guess due to the initial-Hessian quality.
+Combined with Initial MOM (IMOM) orbital tracking and a trust-region
+step control, they form a robust Delta-SCF engine.
+
+%=====================================================================
+\section{Background and equations}\label{sec:background}
+
+\subsection{SCC-DFTB ground-state SCF}
+
+DFTB+ solves a generalised eigenvalue problem of Roothaan--Hall type,
+iterated to self-consistency in the atomic charges. We summarise the
+ingredients and the iteration structure here; \cite{Elstner1998,DFTBplus}
+contain full derivations.
+
+\paragraph{The SCC-DFTB Hamiltonian.}
+The AO-basis Hamiltonian is split into a charge-independent part
+$\mathbf{H}^{0}$ (from Slater--Koster tables, evaluated at neutral
+reference densities) and a charge-dependent SCC correction:
+\begin{equation}
+H_{\mu\nu}[\qq] \;=\; H^{0}_{\mu\nu}
+    \;+\; \tfrac12\, S_{\mu\nu}\, \sum_{\xi\in\text{atoms}}
+     \big(\gamma_{\alpha(\mu)\,\xi} + \gamma_{\alpha(\nu)\,\xi}\big)\,
+     \Delta q_\xi,
+\label{eq:dftbH}
+\end{equation}
+where $\mu\in\alpha(\mu)$ labels the atom carrying AO $\mu$,
+$\gamma_{\alpha\beta}$ is the DFTB gamma-function (a
+distance-dependent Coulomb-like kernel regularised by the atomic
+Hubbard parameters), and $\Delta q_\xi = q_\xi - q_\xi^{0}$ is the
+deviation of the current Mulliken charge on atom $\xi$ from its
+reference (neutral-atom) value. For spin-polarised calculations an
+additional onsite spin coupling enters $\HH[\qq]$; it is treated
+independently for each spin channel and does not alter the structure
+below.
+
+\paragraph{One-electron equation.}
+At fixed $\qq$, the MOs are obtained from the generalised eigenvalue
+problem
+\begin{equation}
+\FF[\qq]\,\CC \;=\; \SS\,\CC\,\bm{\varepsilon},\qquad
+\CC^{\top}\SS\,\CC = \II,
+\label{eq:dftbGEP}
+\end{equation}
+where $\SS$ is the AO overlap. Column $i$ of $\CC$ contains the MO
+coefficients $C_{\mu i}$ of $\ket{\psi_i}=\sum_\mu C_{\mu i}\ket{\mu}$,
+and $\varepsilon_i$ is the corresponding orbital energy. Equation
+\eqref{eq:dftbGEP} is the DFTB analogue of the Roothaan--Hall equation
+$\mathbf{F}\mathbf{C}=\mathbf{S}\mathbf{C}\bm{\varepsilon}$ of
+Hartree--Fock theory, with $\mathbf{F}[\qq]$ replaced by the SCC-DFTB
+Hamiltonian \eqref{eq:dftbH}.
+
+\paragraph{Charge update and Mulliken analysis.}
+At each SCC iteration the charges are recomputed from the MOs by a
+Mulliken population analysis
+\begin{equation}
+q_\alpha \;=\; \sum_i f_i \!\! \sum_{\mu\in\alpha}\sum_\nu
+       C_{\mu i}\, S_{\mu\nu}\, C_{\nu i}
+\;=\; \sum_i f_i \!\! \sum_{\mu\in\alpha} (\mathbf{P}\SS)_{\mu\mu},
+\label{eq:mulliken}
+\end{equation}
+with $\mathbf{P}_{\mu\nu}=\sum_i f_i C_{\mu i}C_{\nu i}$ the AO density
+matrix and $f_i$ the occupation numbers (aufbau: lowest $n_\uparrow /
+n_\downarrow$ per spin in the colinear unrestricted case, or lowest
+$n_\mathrm{e}/2$ for closed shell). $\Delta\qq=\qq-\qq^{0}$ then feeds
+back into Eq.~\eqref{eq:dftbH} for the next iteration.
+
+\paragraph{SCF cycle (Roothaan--Hall style).}
+One SCC iteration $k$ consists of:
+\begin{enumerate}[leftmargin=*,nosep]
+\item Build $\HH[\qq^{(k-1)}]$ from Eq.~\eqref{eq:dftbH}.
+\item Solve Eq.~\eqref{eq:dftbGEP} $\to \CC^{(k)}, \bm{\varepsilon}^{(k)}$.
+\item Apply aufbau to obtain $f_i^{(k)}$; build $\mathbf{P}^{(k)}$.
+\item Compute $\qq^{(k,\mathrm{out})}$ from Eq.~\eqref{eq:mulliken}.
+\item Convergence: $\mathrm{sccErrorQ}=\|\qq^{(k,\mathrm{out})}-\qq^{(k-1)}\|_\infty < \mathtt{SCCTolerance}$?
+\item Else update the input charges by damped mixing
+$\qq^{(k)} = \mathrm{Mixer}(\qq^{(k-1)},\,\qq^{(k,\mathrm{out})}-\qq^{(k-1)})$ (Broyden/DIIS); return to step~1.
+\end{enumerate}
+The fixed point $\qq^*$ of this map satisfies $\qq^*=\qq(\CC(\qq^*))$
+and the MOs it produces diagonalise $\FF[\qq^*]$ in the $\SS$-metric.
+
+\emph{All machinery in the remainder of this document operates on the
+unrestricted case; each spin channel $\sigma\in\{\alpha,\beta\}$ is
+treated independently, with its own $\FF^\sigma$, $\CC^\sigma$,
+$f^\sigma$, and occ/virt partition.}
+
+\subsection{Delta-SCF via State Targeted Energy Projection (STEP)}
+\label{sec:step}
+
+STEP is due to Carter-Fenk and Herbert~\cite{CarterFenkHerbert2020}.
+It uses a level shift applied through the AO-basis virtual-density
+operator $\mathbf{S}\mathbf{Q}\mathbf{S}$ to bias Aufbau selection
+toward the target non-Aufbau configuration.
+
+\paragraph{Non-aufbau target filling.}
+Starting from the ground-state (aufbau) filling
+$f^{(\mathrm{GS})}_i\in\{0,1\}$, the user specifies which orbital
+indices to depopulate (``ExcitedFrom'') and which to populate
+(``ExcitedTo'') to define the target filling $f^{(\mathrm{T})}_i$. For
+example, for HOMO~$\to$~LUMO in a system with 4 occupied $\alpha$
+orbitals, $f^{(\mathrm{T})}=\{1,1,1,0,1,0\}$.
+
+\paragraph{Level-shift operator.}
+Let $\{\ket{\psi^{(k)}_r}\}$ be the current MO set at iteration $k$,
+with MO coefficients $\ket{\psi^{(k)}_r}=\sum_\mu C^{(k)}_{\mu r}\ket{\mu}$
+in the AO basis $\{\ket{\mu}\}$, partitioned into the (current)
+occupied set $\mathrm{occ}^{(k)}$ and virtual set $\mathrm{virt}^{(k)}$.
+Throughout this section we write $a\in\mathrm{virt}^{(k)}$ for a
+virtual-orbital index at iteration $k$, and correspondingly
+$i\in\mathrm{occ}^{(k)}$; the occ/virt partition itself is implementation-specific
+(see the code note below).
+
+Define the virtual projector
+\begin{equation}
+\hat{Q}^{(k)} \;=\; \sum_{a\,\in\,\mathrm{virt}^{(k)}}
+\ket{\psi^{(k)}_a}\bra{\psi^{(k)}_a},
+\qquad
+\hat{Q}^{(k)}\ket{\psi^{(k)}_r}\;=\;\begin{cases}
+\ket{\psi^{(k)}_r}, & r\in\mathrm{virt}^{(k)},\\[2pt]
+0, & r\in\mathrm{occ}^{(k)}.
+\end{cases}
+\end{equation}
+The level-shifted Fock operator is
+\begin{equation}
+\hat{F}'^{(k)} \;=\; \hat{F}[\qq^{(k)}] \;+\; \eta\,\hat{Q}^{(k)},
+\qquad \eta>0,
+\label{eq:stepOp}
+\end{equation}
+so in the MO basis
+\begin{equation}
+\Braket{\psi^{(k)}_r|\hat{F}'^{(k)}|\psi^{(k)}_s}
+\;=\; F^{(k)}_{rs} \;+\; \eta\,\delta_{rs}\,[\![\,r\!\in\!\mathrm{virt}^{(k)}\,]\!].
+\end{equation}
+Each currently-virtual eigenvalue is thus raised by $\eta$ while the
+occupied eigenvalues and the occ--virt block of $\hat{F}$ in the MO
+basis are unchanged.
+
+For the generalised eigenvalue problem in the (non-orthogonal) AO
+basis, we take AO matrix elements of Eq.~\eqref{eq:stepOp}. Using
+$\Braket{\mu|\psi^{(k)}_a}=\sum_\nu S_{\mu\nu}C^{(k)}_{\nu a}=(\SS\CC^{(k)})_{\mu a}$,
+\begin{equation}
+\Braket{\mu|\hat{Q}^{(k)}|\nu}
+\;=\; \sum_{a\,\in\,\mathrm{virt}^{(k)}}
+\Braket{\mu|\psi^{(k)}_a}\Braket{\psi^{(k)}_a|\nu}
+\;=\; \big[\SS\,\mathbf{Q}^{(k)}\,\SS\big]_{\mu\nu},
+\qquad
+Q^{(k)}_{\mu\nu}\;=\!\!\sum_{a\,\in\,\mathrm{virt}^{(k)}}\!
+C^{(k)}_{\mu a}\,C^{(k)}_{\nu a}.
+\end{equation}
+The $\SS$-sandwich arises from AO non-orthogonality
+($\Braket{\mu|\nu}=S_{\mu\nu}\neq\delta_{\mu\nu}$); dropping it would
+be equivalent to $\bra\mu\hat Q\ket\nu=\mathbf Q_{\mu\nu}$, which only
+holds on an orthonormal basis. The AO-basis representation of
+Eq.~\eqref{eq:stepOp} is therefore
+\begin{equation}
+\boxed{\widehat{\FF}^{(k)} \;=\; \FF[\qq^{(k)}] \;+\; \eta\,\SS\,\mathbf{Q}^{(k)}\,\SS,}
+\label{eq:step}
+\end{equation}
+which is the form solved in \cite[Eq.~6]{CarterFenkHerbert2020} and
+implemented in \texttt{buildAndDiagDeltaScfRealHam}.
+
+\paragraph{Code note: identifying $\mathrm{virt}^{(k)}$.}
+The implementation does not store an integer list of virtual indices;
+instead it inspects the real-valued filling array
+$f^{(k)}_r\in[0,1]$ (integer $\{0,1\}$ for closed/open-shell
+non-aufbau fillings here) and treats
+\begin{equation}
+r\in\mathrm{virt}^{(k)} \;\Longleftrightarrow\; f^{(k)}_r<\tfrac12.
+\end{equation}
+The threshold $\tfrac12$ is a robust tie-breaker between integer 0 and
+1 fillings; it plays no mathematical role in the theory above. Inside
+\texttt{buildAndDiagDeltaScfRealHam} this shows up as the loop
+\texttt{if (targetFilling(iOrb,1,iSpin) < 0.5\_dp)} that selects the
+virtual columns from \texttt{eigvecsReal} before forming
+$\mathbf{Q}^{(k)}$.
+
+Following the paper, we anchor $\eta$ to the HOMO--LUMO gap:
+\begin{equation}
+\eta \;=\; |\varepsilon_\mathrm{LUMO}^{(\mathrm{GS})}
+           -\varepsilon_\mathrm{HOMO}^{(\mathrm{GS})}| \,+\, \varepsilon'
+\label{eq:stepEta}
+\end{equation}
+with the default $\varepsilon'=0.1$~Ha. The gap-anchored value is
+just large enough to force the desired occupation at every SCF
+iteration without over-restricting occ--virt rotations, which a very
+large $\eta$ would do. Per the paper, $\eta$ is determined \emph{once}
+from the initial (non-Aufbau) orbitals and held fixed thereafter.
+Alternatively a user-specified fixed $\eta$ (input keyword
+\texttt{ShiftEnergy}) may be supplied.
+
+\paragraph{STEP iteration.}
+\begin{enumerate}
+\item Build $\FF[\qq^{(k)}]$ and $\mathbf{Q}^{(k)}$ from the current
+virtual columns of $\CC^{(k)}$, form
+$\widehat{\FF}^{(k)}=\FF+\eta\,\SS\,\mathbf{Q}^{(k)}\,\SS$, and solve
+\[
+\widehat{\FF}^{(k)}\,\CC^{(k+1)} \;=\; \SS\,\CC^{(k+1)}\,\widehat{\bm{\varepsilon}}^{(k+1)}.
+\]
+\item Assign the $n_\mathrm{e}$ lowest shifted eigenvalues as occupied
+(Aufbau on the shifted spectrum). This is the STEP prescription --- no
+MOM/IMOM match is required in the original paper.
+\item Restore physical eigenvalues by subtracting $\eta$ from the new
+virtual indices:
+$\varepsilon^{(k+1)}_a = \widehat{\varepsilon}^{(k+1)}_a - \eta$ for
+$a\in\mathrm{virt}^{(k+1)}$.
+\item Compute new density and new $\qq^{(k+1)}$; update charges
+(direct substitution or Broyden).
+\item Repeat until the \emph{physical} orbital gradient (not the
+shifted one) satisfies $\max|g_{ia}|<\vartheta_\mathrm{SOSCF}$.
+\end{enumerate}
+Because the MO-basis representation of $\eta\,\SS\mathbf{Q}\SS$ is
+diagonal on the (current) virtual block and zero elsewhere, the
+occ--virt block of the MO-transformed Fock matrix is unchanged by the
+shift. Consequently the \emph{physical} orbital gradient at the
+shifted fixed point equals the gradient for $\FF$ alone: the shifted
+fixed point coincides with a stationary point of the \emph{physical}
+energy in the occ/virt partition set by $f^{(\mathrm{T})}$.
+
+\subsection{Initial Maximum Overlap Method (IMOM)}
+\label{sec:imom}
+
+The original STEP paper~\cite{CarterFenkHerbert2020} uses Aufbau on
+the shifted spectrum alone, without MOM/IMOM, and positions STEP as
+an alternative to MOM-style overlap tracking. In practice, however,
+for non-adjacent or multi-index excitations the Aufbau assignment on
+$\widehat{\bm{\varepsilon}}^{(k+1)}$ can become ambiguous when target
+virtual levels drift through near-degeneracy with occupied levels, so
+we offer IMOM as an optional overlap-based reassignment layered on top
+of STEP (\texttt{UseIMOM}, default \texttt{Yes}).
+
+Initial MOM fixes a \emph{frozen} reference set of eigenvectors
+$\CC^{(\mathrm{ref})}$ (the ground-state eigenvectors at loop entry)
+together with a fixed reference filling $f^{(\mathrm{ref})}$ identifying
+the reference virtual set $\mathrm{virt}^{(\mathrm{ref})}$ (in the code: orbitals with $f^{(\mathrm{ref})}<\tfrac12$).
+At each iteration, given the new eigenvectors $\CC^{(k+1)}$, the
+overlap matrix
+\begin{equation}
+M_{ij} \;=\; \langle \psi^{(k+1)}_i \mid \widehat{S} \mid \psi^{(\mathrm{ref})}_j \rangle
+\;=\;(\CC^{(k+1)})^{\top} \SS\, \CC^{(\mathrm{ref})}
+\end{equation}
+is computed, and filling is re-assigned by \textbf{greedy exclusive
+maximum-overlap} matching: for each $j \in \mathrm{virt}^{(\mathrm{ref})}$, the new
+orbital index
+\begin{equation}
+i^\ast(j) \;=\; \operatorname*{argmax}_{i \notin \mathrm{assigned}}\; |M_{ij}|^2
+\end{equation}
+is marked virtual; all remaining new indices are marked occupied.
+This reassignment replaces aufbau in the STEP step~(2) above and is
+carried through the entire SOSCF iteration as the filling rule.
+
+\subsection{Second-Order SCF (SOSCF)}
+\label{sec:soscf-theory}
+
+\paragraph{Exponential parameterisation.}
+Write the new MOs as a unitary rotation of the current ones:
+\begin{equation}
+\CC^\mathrm{new} \;=\; \CC^\mathrm{old}\, \UU, \qquad
+\UU \;=\; \exp(\kkappa),
+\end{equation}
+with $\kkappa$ a real antisymmetric matrix ($\kkappa^\top=-\kkappa$).
+The only independent variables are the occ--virt block
+$x_{ia}=\kappa_{ia}$ (with $i$ in the occupied and $a$ in the virtual
+set of the current filling), because rotations within the occupied or
+virtual block do not change the density matrix
+$\rho=\sum_i f_i|\psi_i\rangle\langle\psi_i|$.
+
+For one spin channel, stacking $x_{ia}$ into a vector $\xx$ of length
+$n_\mathrm{oo} \equiv n_\mathrm{occ}\cdot n_\mathrm{virt}$, the energy
+is a function $E(\xx)$ and we optimise it on
+$\xx\in\mathbb{R}^{n_\mathrm{oo}}$ with
+\begin{equation}
+\kappa_{ia}\!=\!x_{ia},\quad \kappa_{ai}\!=\!-x_{ia},\quad
+\kappa_{ij}\!=\!\kappa_{ab}\!=\!0.
+\end{equation}
+
+\paragraph{Orbital gradient.}
+At $\xx=0$ the gradient reads
+\begin{equation}
+g_{ia} \;=\; \frac{\partial E}{\partial x_{ia}}\bigg|_{\xx=0}
+\;=\; 4\,[\,\CC^\top \FF \,\CC\,]_{ia}
+\;\equiv\; 4\, F^\mathrm{MO}_{ia}.
+\label{eq:grad}
+\end{equation}
+We derive this in four steps: (i) write the SCC-DFTB energy as a
+functional of the density matrix, (ii) propagate the orbital rotation
+into the density, (iii) differentiate with respect to $\kappa_{rs}$,
+(iv) apply the chain rule from $\kappa$ to $x$ and collect the factor.
+
+\emph{(i) Energy as a functional of $\mathbf{P}$.}
+For the single Slater determinant defined by filling $f$ and MO matrix
+$\CC$, the AO density matrix is
+\begin{equation}
+P_{\mu\nu} \;=\; \sum_p f_p\, C_{\mu p}\, C_{\nu p}.
+\label{eq:densitymat}
+\end{equation}
+The SCC-DFTB total energy \eqref{eq:dftbH} is a functional
+$E[\mathbf{P}]$ whose gradient with respect to $\mathbf{P}$ \emph{is},
+by construction of the Fock/Kohn--Sham matrix, the Hamiltonian itself:
+\begin{equation}
+\frac{\partial E}{\partial P_{\mu\nu}}\bigg|_{\text{const }\qq\text{-dep}} \;=\; H_{\mu\nu}[\qq],
+\qquad \text{with } \qq \text{ also a functional of } \mathbf{P}.
+\label{eq:dEdP}
+\end{equation}
+The crucial simplification for SCF-type energies is that, precisely
+because $\FF$ is built to be $\partial E/\partial\mathbf{P}$, the
+derivatives of $\qq$ with respect to $\mathbf{P}$ cancel out in the
+full $\mathrm{d}E/\mathrm{d}\mathbf{P}$ (this is the statement of the
+variational property / generalised Brillouin theorem). We may
+therefore treat $\FF$ as constant under orbital rotation when computing
+the first derivative of $E$, a standard property of Hartree--Fock-- and
+DFT-type energies \cite[Ch.~10]{HelgakerBook}.
+
+\emph{(ii) Rotation of $\mathbf{P}$.}
+Under $\CC\to\CC\,\UU$ with $\UU=\exp(\kkappa)$, the density matrix
+for fixed $f$ transforms as
+$\mathbf{P}\to\CC\,\UU\,\mathbf{f}\,\UU^{\top}\CC^{\top}$ where
+$\mathbf{f}=\mathrm{diag}(f_p)$. Expanding $\UU=\II+\kkappa+O(\kkappa^2)$,
+\begin{equation}
+P^\mathrm{MO}_{pq}(\kkappa)
+\;\equiv\; (\UU\,\mathbf{f}\,\UU^{\top})_{pq}
+\;=\; f_p\delta_{pq} + (f_q - f_p)\kappa_{pq} + O(\kkappa^2).
+\label{eq:Pmo-rot}
+\end{equation}
+The MO-basis density change is thus
+$\Delta P^\mathrm{MO}_{pq} = (f_q-f_p)\kappa_{pq}$ to first order.
+
+\emph{(iii) Differentiation w.r.t.\ $\kappa_{rs}$.}
+Writing $E$ in the MO basis, $E = \sum_{pq} P^\mathrm{MO}_{pq} F^\mathrm{MO}_{qp}/2 + \text{(terms independent of } \kkappa)$ for the SCF part and using
+\eqref{eq:dEdP}, and holding $F^\mathrm{MO}$ fixed (the variational
+property above),
+\begin{equation}
+\frac{\partial E}{\partial \kappa_{rs}}\bigg|_{\kkappa=0}
+\;=\; \sum_{pq}\frac{\partial P^\mathrm{MO}_{pq}}{\partial \kappa_{rs}}\,F^\mathrm{MO}_{qp}
+\;=\; (f_s - f_r)\,F^\mathrm{MO}_{rs} \;+\; (f_r - f_s)\,F^\mathrm{MO}_{sr}
+\;=\; 2(f_s-f_r)\,F^\mathrm{MO}_{rs},
+\label{eq:dEdkappa}
+\end{equation}
+where the last equality uses $F^\mathrm{MO}_{sr}=F^\mathrm{MO}_{rs}$
+(Hermiticity with real MOs). For $r=i\in\mathrm{occ}$, $s=a\in\mathrm{virt}$
+with integer fillings $f_i=1,\;f_a=0$ this gives
+$\partial E/\partial\kappa_{ia}\big|_0 = -2\,F^\mathrm{MO}_{ia}$, and
+$\partial E/\partial\kappa_{ai}\big|_0 = +2\,F^\mathrm{MO}_{ai} = +2\,F^\mathrm{MO}_{ia}$.
+
+\emph{(iv) Chain rule $\kappa\to x$.}
+Since the independent variable is $x_{ia}$ with
+$\kappa_{ia}=x_{ia}$ and $\kappa_{ai}=-x_{ia}$,
+\begin{equation}
+\frac{\partial E}{\partial x_{ia}}\bigg|_{0}
+\;=\; \frac{\partial E}{\partial \kappa_{ia}}\bigg|_{0}\frac{\partial \kappa_{ia}}{\partial x_{ia}}
+\;+\; \frac{\partial E}{\partial \kappa_{ai}}\bigg|_{0}\frac{\partial \kappa_{ai}}{\partial x_{ia}}
+\;=\; (-2\,F^\mathrm{MO}_{ia})(+1) + (+2\,F^\mathrm{MO}_{ia})(-1)
+\;=\; -4\,F^\mathrm{MO}_{ia}.
+\end{equation}
+The sign depends on the sign convention for $\kappa$ in the
+exponential; the code uses the opposite convention $\CC_\mathrm{new}=\CC\,\UU(-\kkappa)$-equivalent sign
+such that $g_{ia}=+4\,F^\mathrm{MO}_{ia}$ as in Eq.~\eqref{eq:grad} (see
+\texttt{soscf.F90:283}). The magnitude~4 is a factor-of-two product
+from antisymmetry of $\kkappa$ (both the $ia$ and $ai$ entries
+contribute) times the factor $2$ in the density-matrix transformation
+\eqref{eq:Pmo-rot}, and is kept consistent with the factor~2 in the
+initial diagonal Hessian \eqref{eq:hess-diag} so that the quasi-Newton
+step $\mathrm{D}\xx=-\HH^{-1}\gg$ has the standard
+$F^\mathrm{MO}_{ia}/(\varepsilon_a-\varepsilon_i)$ scale. The
+stationary point $g_{ia}=0 \Leftrightarrow F^\mathrm{MO}_{ia}=0$
+(block-diagonal MO Fock) is independent of this overall prefactor.
+
+\paragraph{Physical interpretation.}
+$g_{ia}\propto F^\mathrm{MO}_{ia}$ is the off-diagonal occ--virt
+matrix element of the Fock/Kohn--Sham operator in the current MO
+basis. At an SCF stationary point this block is exactly zero, so
+$g_{ia}=0$ means the current MOs already diagonalise $\FF$ in the
+occ/virt partition chosen by $f^{(\mathrm{T})}$. Driving
+$\max_{ia}|g_{ia}|\to 0$ is therefore equivalent to satisfying
+Eq.~\eqref{eq:dftbGEP} on the non-Aufbau manifold.
+
+\paragraph{Orbital Hessian (diagonal approximation).}
+The diagonal element of the orbital Hessian in the ORCA
+convention is
+\begin{equation}
+H_{ia,ia}
+\;=\; 2\,(f_a - f_i)(\varepsilon_i - \varepsilon_a)
+\;=\; 2\,(\varepsilon_a - \varepsilon_i) \quad \text{for integer filling}
+\label{eq:hess-diag}
+\end{equation}
+where the final equality uses $f_\mathrm{occ}=1,\,f_\mathrm{virt}=0$.
+The corresponding initial inverse Hessian (used at the first SOSCF
+step) is
+\begin{equation}
+\big[H^{-1}\big]_{ia,ia}^{(0)}
+\;=\;\frac{\operatorname{sign}(\Delta_{ia})}
+{\max\!\big(2\,|\Delta_{ia}|,\; 10^{-3}\big)},
+\qquad \Delta_{ia}\!=\!\varepsilon_a-\varepsilon_i.
+\label{eq:invH-init}
+\end{equation}
+The \emph{signed} form \eqref{eq:invH-init} is essential for
+excited-state saddles: when the target has a negative-curvature mode
+(orbital $a$ virtual in target but $\varepsilon_a<\varepsilon_i$ in
+the ground state), $\Delta_{ia}<0$ and the inverse-Hessian element
+becomes negative, so that the Newton step
+$\mathrm{D}x=-H^{-1}g$ points \emph{uphill} along that
+direction --- exactly what is needed to converge to a saddle.
+
+\paragraph{Quasi-Newton step.}
+At iteration $n$,
+\begin{equation}
+\mathrm{D}\xx_n \;=\; -\,\HH_n^{-1}\,\gg_n,
+\label{eq:newton-step}
+\end{equation}
+followed by a trust-region clip (\S\ref{sec:trust-region} below) and
+orbital rotation
+\begin{equation}
+\CC_{n+1} \;=\; \CC_n\,\exp(\kkappa_n), \qquad
+\kkappa_n \leftarrow \text{stack of } \mathrm{D}x_{ia}.
+\end{equation}
+
+\paragraph{Cayley approximant for $\exp(\kkappa)$.}
+The unitary factor is computed via the Pad\'e[1,1] (Cayley) form
+\begin{equation}
+\UU \;=\; (\II-\tfrac12\kkappa)^{-1}(\II+\tfrac12\kkappa),
+\label{eq:cayley}
+\end{equation}
+which is \emph{exactly} orthogonal for any real antisymmetric
+$\kkappa$ (no truncation error in orthogonality), is second-order
+accurate in $\kkappa$, and reduces to one linear solve per iteration.
+This avoids the Taylor truncation error and orthogonality drift of
+$\UU \approx \II + \kkappa + \tfrac12\kkappa^2 + \dots$.
+
+\subsection{L-SR1 inverse-Hessian update}
+\label{sec:lsr1}
+
+The true orbital Hessian is $O(n_\mathrm{oo}^2)$ to store and expensive
+to evaluate, so SOSCF maintains an approximation that is updated from
+secant information after every iteration. The choice of update rule is
+\emph{not} cosmetic for excited-state $\Delta$-SCF: it is dictated by
+the sign structure of the Hessian at the target stationary point.
+
+\paragraph{Why not BFGS: the indefinite-Hessian obstruction.}
+Standard quasi-Newton optimisation methods like BFGS are designed for
+\emph{minimisation} of convex objectives and are built to enforce
+positive definiteness of the approximate Hessian. Concretely, the
+BFGS update of the inverse Hessian,
+\begin{equation}
+\HH^{-1,\mathrm{BFGS}}_{n+1}
+\;=\; \Big(\II - \frac{\bm{\delta}_n\bm{\gamma}_n^{\top}}{\bm{\gamma}_n^{\top}\bm{\delta}_n}\Big)
+      \HH^{-1}_n
+      \Big(\II - \frac{\bm{\gamma}_n\bm{\delta}_n^{\top}}{\bm{\gamma}_n^{\top}\bm{\delta}_n}\Big)
+ \;+\; \frac{\bm{\delta}_n\bm{\delta}_n^{\top}}{\bm{\gamma}_n^{\top}\bm{\delta}_n},
+\label{eq:bfgs}
+\end{equation}
+preserves $\HH^{-1}_n\succ 0\Rightarrow\HH^{-1}_{n+1}\succ 0$ whenever
+the curvature condition $\bm{\gamma}_n^{\top}\bm{\delta}_n>0$ is
+satisfied (and damping is used when it is not). Applied to an
+excited-state saddle this is catastrophic: at the target, the true
+orbital Hessian has at least one \emph{negative} eigenvalue along the
+$\mathrm{GS}\to\mathrm{ES}$ de-excitation direction, and the
+saddle-seeking Newton step $\mathrm{D}\xx=-\HH^{-1}\gg$ requires
+$\HH^{-1}$ to inherit that negative sign. A BFGS-maintained
+$\HH^{-1}\succ 0$ always yields descent directions, so
+$\mathrm{D}\xx=-\HH^{-1}\gg$ points \emph{downhill} along the GS
+direction --- i.e., toward variational collapse to the Aufbau ground
+state. The same objection rules out L-BFGS, damped-BFGS, and any
+other positive-definiteness-enforcing variant.
+
+\paragraph{Why SR1: signature-preserving rank-1 update.}
+The symmetric rank-$1$ (SR1) update is the unique symmetric update of
+rank~1 that satisfies the secant equation, and it \emph{does not}
+enforce any sign on the curvature it generates. If the secant pair
+$(\bm{\delta}_n,\bm{\gamma}_n)$ reveals negative curvature
+($\bm{j}_n^{\top}\bm{\gamma}_n<0$, with $\bm{j}_n$ defined below), the
+SR1 correction subtracts rather than adds to $\HH^{-1}$, so the
+approximate inverse Hessian can (and does) become indefinite whenever
+the true Hessian is. This is the standard reason SR1 is recommended
+over BFGS for trust-region methods that must converge to saddle
+points \cite[Ch.~6]{NocedalWright}.
+
+Using SR1 with a \emph{signed} initial diagonal inverse Hessian
+(Eq.~\eqref{eq:invH-init}) gives SR1 the correct starting signature
+in each occ--virt direction; the rank-1 updates then refine, but do
+not wash out, the negative-curvature modes along which the target is
+a saddle.
+
+\paragraph{Secant pair and secant condition.}
+After the step $\mathrm{D}\xx_n$ and gradient recomputation,
+\begin{equation}
+\bm{\delta}_n \;\equiv\; \mathrm{D}\xx_n, \qquad
+\bm{\gamma}_n \;\equiv\; \gg_{n+1} - \gg_n.
+\end{equation}
+The standard quasi-Newton \emph{secant condition} on the inverse
+Hessian is that $\HH^{-1}_{n+1}$ should map the observed gradient
+change back to the observed step:
+\begin{equation}
+\HH^{-1}_{n+1}\,\bm{\gamma}_n \;=\; \bm{\delta}_n.
+\label{eq:secant}
+\end{equation}
+This is the first-order Taylor statement
+$\bm{\gamma}_n = \HH_{n+1}\bm{\delta}_n+O(\|\bm\delta\|^2)$ with $\HH = (\HH^{-1})^{-1}$, and any quasi-Newton update of $\HH^{-1}$
+must satisfy it.
+
+\paragraph{Derivation of the SR1 update (inverse-Hessian form).}
+We seek the simplest update of $\HH^{-1}$ that (a) is symmetric,
+(b) is rank~1, (c) satisfies \eqref{eq:secant}, and (d) does not
+constrain the sign of the curvature generated. The rank-1 symmetric
+ansatz is
+\begin{equation}
+\HH^{-1}_{n+1} \;=\; \HH^{-1}_n \;+\; \sigma\,\mathbf{v}\,\mathbf{v}^{\top},
+\qquad \sigma\in\{+1,-1\},\ \mathbf{v}\in\mathbb{R}^{n_\mathrm{oo}}.
+\label{eq:sr1ansatz}
+\end{equation}
+Applying the secant condition \eqref{eq:secant} gives
+\begin{align}
+\HH^{-1}_n\,\bm{\gamma}_n \;+\; \sigma\,(\mathbf{v}^{\top}\bm{\gamma}_n)\,\mathbf{v}
+\;&=\;\bm{\delta}_n \notag\\
+\Longrightarrow\quad
+\sigma\,(\mathbf{v}^{\top}\bm{\gamma}_n)\,\mathbf{v}
+\;&=\;\bm{\delta}_n \;-\; \HH^{-1}_n\,\bm{\gamma}_n
+\;\equiv\;\bm{j}_n.
+\label{eq:sr1-v-parallel-j}
+\end{align}
+Equation~\eqref{eq:sr1-v-parallel-j} says $\mathbf{v}$ is parallel to
+$\bm{j}_n$, i.e.\ $\mathbf{v}=\lambda\,\bm{j}_n$ for some scalar
+$\lambda$. Substituting,
+\begin{equation}
+\sigma\,\lambda^2\,(\bm{j}_n^{\top}\bm{\gamma}_n)\,\bm{j}_n
+\;=\; \bm{j}_n
+\;\Longrightarrow\;
+\sigma\,\lambda^2\;=\;\frac{1}{\bm{j}_n^{\top}\bm{\gamma}_n}.
+\end{equation}
+The combined scalar $\sigma\lambda^2$ is uniquely determined; absorbing
+it gives the SR1 inverse-Hessian update
+\begin{equation}
+\boxed{\HH^{-1}_{n+1} \;=\; \HH^{-1}_n \;+\;
+\frac{\bm{j}_n\,\bm{j}_n^{\top}}{\bm{j}_n^{\top}\bm{\gamma}_n},
+\qquad \bm{j}_n \;=\; \bm{\delta}_n - \HH^{-1}_n\,\bm{\gamma}_n.}
+\label{eq:lsr1}
+\end{equation}
+The sign of the rank-1 correction is carried by the scalar
+$\bm{j}_n^{\top}\bm{\gamma}_n$, which is \emph{not} constrained to be
+positive: when the secant pair samples a negative-curvature direction
+(the true Hessian has negative eigenvalues there), the denominator is
+negative and $\HH^{-1}$ picks up a negative rank-1 correction along
+$\bm{j}_n$. This is exactly the behaviour required to track a
+saddle-shaped objective, and is the main technical reason SR1 (and
+not BFGS) is used here.
+
+\paragraph{Safeguards.}
+Two numerical safeguards are applied in the code
+(\texttt{updateInvHessianLSR1}):
+\begin{itemize}[leftmargin=*,nosep]
+\item \textbf{Denominator guard:} skip the update if
+$|\bm{j}_n^{\top}\bm{\gamma}_n| < \tau\,\|\bm{j}_n\|\,\|\bm{\gamma}_n\|$
+with $\tau=10^{-8}$. Equivalently, the rank-1 coefficient
+$1/(\bm{j}_n^{\top}\bm{\gamma}_n)$ is rejected when $\bm{j}_n$ is
+nearly orthogonal to $\bm{\gamma}_n$, which would otherwise divide by a
+catastrophically small denominator and inflate $\|\HH^{-1}\|$.
+This is the classic SR1 failure mode \cite[\S6.2]{NocedalWright}.
+\item \textbf{Step-norm guard:} skip if $\|\bm{\delta}_n\| < 10^{-5}$.
+A negligibly small step samples no curvature; the resulting
+$(\bm{\delta},\bm{\gamma})$ is dominated by floating-point noise, and
+the rank-1 update amplifies that noise as $\|\bm{\delta}\|^2/|\bm{j}^{\top}\bm{\gamma}|$.
+\end{itemize}
+When either guard fires, $\HH^{-1}_{n+1}=\HH^{-1}_n$ is used; the
+missed update simply defers curvature refinement to the next
+iteration.
+
+\subsection{Trust-region step control}
+\label{sec:trust-region}
+
+The diagonal initial inverse Hessian \eqref{eq:invH-init} ignores the
+off-diagonal Coulomb/exchange couplings between occ--virt pairs. For
+high-order excited-state saddles (e.g.\ double excitations) the
+un-scaled Newton step \eqref{eq:newton-step} can exceed $1$~rad,
+invalidating the Cayley linearisation, scrambling IMOM assignments,
+and poisoning subsequent L-SR1 updates.
+
+We cap the per-iteration rotation magnitude:
+\begin{equation}
+\boxed{
+\mathrm{D}\xx_n \leftarrow \mathrm{D}\xx_n \cdot
+\min\!\left(1,\; \frac{\kappa_\mathrm{max}}{\max_{ia}|\mathrm{D}x_{ia}|}\right).
+}
+\label{eq:trust-cap}
+\end{equation}
+The step \emph{direction} is preserved, only the magnitude is
+shrunk. Below the cap (e.g.\ at convergence) the rescaling is the
+identity, so we recover full superlinear Newton convergence. The
+default $\kappa_\mathrm{max}=0.5$~rad
+($\sim 29^\circ$) is a standard trust-region setting for orbital
+optimisation~\cite{Bacskay1981,HelgakerBook}. See
+\S\ref{sec:results-dblexc} for the rationale of this value.
+
+%=====================================================================
+\section{Full algorithm}\label{sec:algorithm}
+
+After the ground-state SCC loop, the driver dispatches on \texttt{tSoscf}:
+\begin{itemize}[leftmargin=*,nosep]
+\item If \texttt{tSoscf = .true.}: run \texttt{runPreSoscfDeltaScfLoop}
+  (\S\ref{sec:algo-preSOSCF}, warm-start) then
+  \texttt{runSoscfLoop} (\S\ref{sec:algo-soscf}, tight convergence).
+\item If \texttt{tSoscf = .false.}: run \texttt{runDeltaScfStandaloneLoop},
+  a level-shifted Delta-SCF that converges on the ground-state SCC
+  criterion $\mathrm{sccErrorQ}<\mathtt{SCCTolerance}$ and returns that
+  result directly (no orbital-rotation phase).
+\end{itemize}
+
+\subsection{Overall flow}
+
+\begin{algorithm}[H]
+\caption{DFTB+ excited-state Delta-SCF / SOSCF driver (see \texttt{main.F90:1371}).}
+\label{alg:overall}
+\begin{algorithmic}[1]
+\State Run ground-state SCC loop to convergence (sccErrorQ $<$ SCCTolerance).
+\State Save GS eigenvectors $\CC^{(\mathrm{GS})}$ and eigenvalues $\bm{\varepsilon}^{(\mathrm{GS})}$.
+\State Build target filling $f^{(\mathrm{T})}$ from ExcitedFrom / ExcitedTo indices (\texttt{buildDeltaScfTargetFilling}).
+\If{\texttt{tDeltaScf} \textbf{and} \texttt{tRealHS}}
+  \If{\texttt{tSoscf}}
+    \State \textbf{runPreSoscfDeltaScfLoop} $\to$ warm-start; exits on $\max|g|<\vartheta_\mathrm{SOSCF}$ (Alg.~\ref{alg:deltaScf}).
+    \State \textbf{runSoscfLoop} $\to$ tight SOSCF; one Newton rotation per outer iter (Alg.~\ref{alg:soscf}). Refreshes $\bm{\varepsilon}\leftarrow\mathrm{diag}(\CC^{\top}\FF\CC)$ on exit.
+  \Else
+    \State \textbf{runDeltaScfStandaloneLoop} $\to$ exits on $\mathrm{sccErrorQ}<\mathtt{SCCTolerance}$.
+  \EndIf
+\EndIf
+\State Write band.out (sorted ascending by $\varepsilon$ after SOSCF; unsorted otherwise) / detailed.out / charges.bin.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Pre-SOSCF: level-shifted Delta-SCF (STEP\,$\pm$\,IMOM)}
+\label{sec:algo-preSOSCF}
+
+\begin{algorithm}[H]
+\caption{\texttt{runPreSoscfDeltaScfLoop} (main.F90:7733). \textbf{Exit
+criterion:} $\max|g|<\vartheta_\mathrm{SOSCF}$ only; $\mathrm{sccErrorQ}$
+is computed and printed for diagnostics but is \emph{not} an exit
+condition (charge self-consistency is handled by the SOSCF outer loop).}
+\label{alg:deltaScf}
+\begin{algorithmic}[1]
+\If{\texttt{UseIMOM}}
+  \State $\CC^{(\mathrm{ref})} \gets \CC^{(\mathrm{GS})}$;
+         $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$
+         \Comment{frozen IMOM reference}
+\EndIf
+\State Determine level shift $\eta$ \emph{once}: user-supplied
+       \texttt{ShiftEnergy}, or
+       $\eta = \varepsilon_\mathrm{LUMO}^{(\mathrm{GS})}
+             - \varepsilon_\mathrm{HOMO}^{(\mathrm{GS})}
+             + \varepsilon'$ with
+       $\varepsilon'\equiv\mathtt{ShiftMargin}$
+       (Eq.~\eqref{eq:stepEta}).
+\State Initialise $f^{(0)} \gets f^{(\mathrm{T})}$
+\For{$k = 1, 2, \dots, \mathrm{MaxSCC}$}
+  \State {[a]} Build $\FF[\qq^{(k-1)}]$ (\texttt{getSccHamiltonian}).
+  \State {[b,c]} Build $\mathbf{Q}^{(k-1)}=\sum_{a\in\mathrm{virt}^{(k-1)}} \CC^{(k-1)}_{:,a}(\CC^{(k-1)}_{:,a})^{\top}$ from current virtual columns and solve the level-shifted problem
+         $(\FF + \eta\,\SS\mathbf{Q}^{(k-1)}\SS)\CC^{(k)}
+         = \SS\CC^{(k)}\widehat{\bm{\varepsilon}}^{(k)}$ (\texttt{buildAndDiagDeltaScfRealHam}, Eq.~\eqref{eq:step}).
+  \State {[d]} Aufbau on $\widehat{\bm{\varepsilon}}^{(k)}$ sets
+         tentative $f^{(k)}$ (\texttt{getFillingsAndBandEnergies}).
+  \If{\texttt{UseIMOM}}
+    \State {[d']} compute $M=(\CC^{(k)})^\top \SS\, \CC^{(\mathrm{ref})}$; greedy virtual-index reassignment overrides $f^{(k)}$ (\texttt{getIMOMTargetFilling}).
+  \EndIf
+  \State {[e]} Restore physical eigenvalues: $\varepsilon^{(k)}_a \gets \widehat{\varepsilon}^{(k)}_a - \eta$ for $a\in\mathrm{virt}^{(k)}$ (\texttt{restoreDeltaScfEigenvalues}).
+  \State {[e2]} Compute physical gradient $g^{(k)}_{ia} = 4\,[\,(\CC^{(k)})^\top\FF\CC^{(k)}\,]_{ia}$ from the \emph{unshifted} $\FF$ (\texttt{computeOrbGradient}).
+  \If{$\max_{ia}|g^{(k)}_{ia}| < \vartheta_\mathrm{SOSCF}$}
+     \State \textbf{exit (handoff to SOSCF)}
+  \EndIf
+  \State {[f--k]} Build density $\rho$, output charges $\qq^{(k,\mathrm{out})}$, energies.
+  \State \hskip 1.0em Compute $\mathrm{sccErrorQ}=\|\qq^{(k,\mathrm{out})}-\qq^{(k-1)}\|_\infty$ (diagnostic only).
+  \State {[l]} Charge update ($\qq^{(k)}\!:=\!\qq^\mathrm{in}$ for iter $k{+}1$):
+     \textbf{if \texttt{UseMixer}}: Broyden/DIIS step on $\qq^{(k,\mathrm{out})}-\qq^{(k-1)}$;
+     \textbf{else}: $\qq^{(k)}\gets\qq^{(k,\mathrm{out})}$.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+The companion routine \texttt{runDeltaScfStandaloneLoop} (used when
+\texttt{tSoscf = .false.}) shares steps [a]--[l] but replaces the
+$\max|g|$-based exit with the standard SCC criterion
+$\mathrm{sccErrorQ}<\mathtt{SCCTolerance}$; no gradient is computed
+there.
+
+\subsection{SOSCF outer loop}
+\label{sec:algo-soscf}
+
+\begin{algorithm}[H]
+\caption{\texttt{runSoscfLoop} (main.F90:8339). One Broyden/DIIS charge
+update \emph{and} one quasi-Newton orbital rotation per outer
+iteration; no inner diagonalisation.}
+\label{alg:soscf}
+\begin{algorithmic}[1]
+\State \texttt{soscf\_init}: for each spin, partition occ/virt via
+       $f^{(\mathrm{T})}$, allocate
+       $\HH^{-1}\in\mathbb{R}^{n_\mathrm{oo}\times n_\mathrm{oo}}$, set
+       $\HH^{-1} \gets \mathrm{diag}\big(\operatorname{sign}(\Delta_{ia})/\max(2|\Delta_{ia}|,10^{-3})\big)$
+       per Eq.~\eqref{eq:invH-init}; record $\kappa_\mathrm{max}$.
+\State Initialise orbital-tracking reference from the post-pre-SOSCF state:
+       $\CC^{(\mathrm{ref})}\gets\CC$, $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$.
+       \Comment{\texttt{UseIMOM=.true.}: frozen; \texttt{.false.}: advanced at end of Step A each iter.}
+\State Reset the Broyden/DIIS mixer history once (only if \texttt{UseMixer}).
+\For{$n = 1, 2, \dots, \mathrm{MaxSCC}$}
+  \State \textbf{Step A --- Orbital rotation at the current $\qq^\mathrm{in}$}:
+  \State \qquad Rebuild $\FF\gets\FF[\qq^\mathrm{in}]$ from the current input charges (inherited from pre-SOSCF at $n=1$, otherwise from Step~B of iter $n{-}1$).
+  \State \qquad \textbf{for each spin:}
+  \State \qquad\qquad Compute gradient $\gg_{ia}=4[\,\CC^{\top}\FF\,\CC\,]_{ia}$ on occ--virt (\texttt{computeOrbGradient}); record $\max|g|$ for outer convergence.
+  \State \qquad\qquad \textbf{if $n>1$}: L-SR1 update~\eqref{eq:lsr1} with $\bm{\delta}=\mathrm{D}\xx_{n-1}$, $\bm{\gamma}=\gg-\gg_{\mathrm{prev}}$ (\texttt{updateInvHessianLSR1}).
+  \State \qquad\qquad Store $\gg_\mathrm{prev}\gets\gg$. Compute Newton step $\mathrm{D}\xx=-\HH^{-1}\gg$ with trust-region clip~\eqref{eq:trust-cap} (\texttt{getSoscfStep}).
+  \State \qquad\qquad Store $\mathrm{D}\xx_\mathrm{prev}\gets\mathrm{D}\xx$. Build $\kkappa$ from $\mathrm{D}\xx$ (\texttt{buildKappa}), form Cayley $\UU$~\eqref{eq:cayley} (\texttt{computeCayleyExp}), rotate $\CC\gets\CC\,\UU$.
+  \State \qquad\qquad Reassign $f^{(\mathrm{T})}$ by max-overlap of $\CC^\mathrm{new}$ against $(\CC^{(\mathrm{ref})},f^{(\mathrm{ref})})$ (\texttt{getIMOMTargetFilling}).
+  \State \qquad \textbf{if \texttt{not UseIMOM}}: advance tracking reference
+         $\CC^{(\mathrm{ref})}\gets\CC^\mathrm{new}$, $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$ \Comment{classical MOM}
+  \State \textbf{Step B --- Density, charges and energies at the post-rotation $\CC$}:
+  \State \qquad Build $\rho$ from $\CC^\mathrm{new}$ and $f^{(\mathrm{T})}$; compute output charges $\qq^\mathrm{out}$ (Mulliken).
+  \State \qquad Evaluate all energy contributions and $E_\mathrm{elec}$ at the rotated state (\texttt{calcEnergies}, \texttt{sumEnergies}).
+  \State \qquad $\mathrm{sccErrorQ}\gets\|\qq^\mathrm{out}-\qq^\mathrm{in}\|_\infty$ (residual at $\CC^\mathrm{new}$ against the $\qq^\mathrm{in}$ used by Step~A of this iter).
+  \State \qquad \textbf{if \texttt{UseMixer}}:
+         $\qq^\mathrm{in}\gets\mathrm{Broyden}(\qq^\mathrm{in},\qq^\mathrm{out}-\qq^\mathrm{in})$;
+         \textbf{else}: $\qq^\mathrm{in}\gets\qq^\mathrm{out}$. \Comment{advances $\qq^\mathrm{in}$ for Step~A of iter $n{+}1$}
+  \State \textbf{Step C --- Convergence check}:
+  \If{$\mathrm{sccErrorQ}<\mathtt{OuterSCCTolerance}$
+      \textbf{and} $\max|\gg|<\vartheta_\mathrm{SOSCF}$}
+     \State \textbf{exit}
+  \EndIf
+\EndFor
+\State Refresh $\bm{\varepsilon}\leftarrow\mathrm{diag}(\CC^{\top}\FF\CC)$ so downstream output (band.out, detailed.out) is consistent with the rotated MOs.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Post-processing.}
+After the SOSCF outer loop exits, the eigenvalue array
+$\bm{\varepsilon}$ is stale (SOSCF rotates the MOs but does not
+re-diagonalise). We refresh it by
+$\varepsilon_i \leftarrow \langle\CC_i|\FF|\CC_i\rangle$
+(the diagonal of $F^\mathrm{MO}$), which at the SOSCF stationary
+point --- where $F^\mathrm{MO}$ is block-diagonal between occ and
+virt --- is the physical orbital energy up to a within-block rotation.
+
+%=====================================================================
+\section{Implementation in DFTB+}\label{sec:implementation}
+
+\subsection{Input keywords (HSD)}
+
+All excited-state keywords live inside the
+\texttt{Hamiltonian=DFTB\{\dots\}} block as two sub-blocks:
+
+\begin{lstlisting}[style=hsd,caption={Input example: formaldehyde HOMO-1 $\to$ LUMO+1 / HOMO $\to$ LUMO+2 double excitation (illustrates overrides; keywords not shown take the defaults listed below).}]
+Hamiltonian = DFTB {
+  SCC             = Yes
+  SCCTolerance    = 1e-8
+  MaxSCCIterations= 400
+  ...
+  DeltaSCF = {
+    ShiftMargin        = 0.1    # Ha; eta = |HOMO-LUMO gap| + ShiftMargin
+    # UseIMOM          = Yes    # (default) greedy overlap orbital tracking
+    # UseMixer         = No     # (default) direct substitution q_in := q_out
+    ExcitedFrom_alpha  = {5 6}  # vacate alpha orbitals 5 and 6
+    ExcitedTo_alpha    = {7 8}  # populate alpha orbitals 7 and 8
+  }
+  SOSCF = {
+    Threshold          = 1e-4   # (default) pre-SOSCF handoff + final max|g|
+    OuterSCCTolerance  = 1e-7   # charge convergence in outer loop
+    # UseMixer         = No     # (default) direct substitution
+    # UseMaxKappa      = Yes    # (default) trust-region step clip
+    MaxKappa           = 0.2    # override (default 0.5 rad); tighter for double excitations
+    Verbosity          = Yes    # detailed diagnostics in soscf.out
+    ExcitedFrom_alpha  = {5 6}  # must match DeltaSCF
+    ExcitedTo_alpha    = {7 8}  # must match DeltaSCF
+  }
+}
+\end{lstlisting}
+
+\paragraph{Keyword reference.}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Block/Keyword & Default & Meaning \\
+\midrule
+\multicolumn{3}{l}{\textbf{DeltaSCF block}} \\
+\texttt{ShiftEnergy} & --- & Fixed level shift $\eta$ (Ha). Mutually exclusive with \texttt{ShiftMargin}. \\
+\texttt{ShiftMargin} & 0.1 & $\varepsilon'$ in Eq.~\eqref{eq:stepEta}: $\eta = (\varepsilon_\mathrm{LUMO}^\mathrm{GS}-\varepsilon_\mathrm{HOMO}^\mathrm{GS})+\varepsilon'$. \\
+\texttt{UseIMOM} & \texttt{Yes} & If \texttt{Yes}: IMOM in pre-SOSCF and IMOM (frozen reference) in SOSCF outer loop; if \texttt{No}: plain Aufbau in pre-SOSCF and classical MOM (reference advanced each iter) in SOSCF. \\
+\texttt{UseMixer} & \texttt{No} & Broyden mixer in pre-SOSCF Delta-SCF (default: direct substitution, STEP reference). Also consulted by \texttt{runDeltaScfStandaloneLoop} when SOSCF is disabled. \\
+\texttt{ExcitedFrom\_alpha} & --- & List of $\alpha$ orbital indices to vacate. \\
+\texttt{ExcitedTo\_alpha}   & --- & List of $\alpha$ orbital indices to populate. \\
+\texttt{ExcitedFrom\_beta}  & --- & Optional $\beta$ indices. \\
+\texttt{ExcitedTo\_beta}    & --- & Optional $\beta$ indices. \\
+\midrule
+\multicolumn{3}{l}{\textbf{SOSCF block}} \\
+\texttt{Threshold}          & $10^{-4}$ & $\vartheta_\mathrm{SOSCF}$: pre-SOSCF handoff + SOSCF gradient criterion (Ha). \\
+\texttt{OuterSCCTolerance}  & $10^{-8}$  & Charge convergence criterion in the SOSCF outer loop; see Eq.~\eqref{eq:conv-SOSCF}. \\
+\texttt{UseMixer}           & \texttt{No}  & Broyden/DIIS mixer inside SOSCF outer loop (default: direct substitution). \\
+\texttt{UseMaxKappa}        & \texttt{Yes} & Enable trust-region clip on $\kkappa$. \\
+\texttt{MaxKappa}           & 0.5 & $\kappa_\mathrm{max}$ in radians. \\
+\texttt{Verbosity}          & \texttt{No} & Write detailed per-iter diagnostics to soscf.out. \\
+\texttt{ExcitedFrom\_alpha}, \texttt{ExcitedTo\_alpha} & --- & Must match DeltaSCF block. \\
+\texttt{ExcitedFrom\_beta}, \texttt{ExcitedTo\_beta} & --- & Optional. \\
+\bottomrule
+\end{tabular}
+\caption{Input keywords specific to the Delta-SCF / SOSCF extension.}
+\end{table}
+
+\subsection{Data structures}
+
+The SOSCF state is held in the derived type \texttt{TSoscf}
+(\texttt{dftb/soscf.F90}):
+
+\begin{lstlisting}[style=fortran,caption={\texttt{TSoscfSpin} (per spin channel) and \texttt{TSoscf} (top-level), from \texttt{dftb/soscf.F90}.}]
+type :: TSoscfSpin
+  integer :: nOcc = 0
+  integer :: nVirt = 0
+  integer :: nOccVirt = 0              ! = nOcc * nVirt
+  integer,  allocatable :: occIdx(:), virtIdx(:)   ! 1-based indices
+  real(dp), allocatable :: xVec(:)     ! accumulated rotation vector (nOccVirt)
+  real(dp), allocatable :: gPrev(:)    ! previous-iter gradient (for gamma = g - gPrev)
+  real(dp), allocatable :: DxPrev(:)   ! previous-iter step     (for delta = DxPrev)
+  real(dp), allocatable :: invHess(:,:)! full symmetric (nOccVirt x nOccVirt) inv-Hessian
+  logical :: isInitialized = .false.
+end type TSoscfSpin
+
+type :: TSoscf
+  integer :: nSpin = 0
+  type(TSoscfSpin), allocatable :: spin(:)
+  real(dp) :: threshold   = 1.0e-4_dp   ! handoff / final max|g| threshold
+  logical  :: useMaxKappa = .true.      ! enable trust-region clip
+  real(dp) :: maxKappa    = 0.5_dp      ! cap in rad
+end type TSoscf
+\end{lstlisting}
+
+On the run-state struct (\texttt{TDftbPlusMain} in
+\texttt{initprogram.F90}) we add companion control fields and flags.
+The defaults shown are the values used when the corresponding HSD
+keyword is omitted:
+
+\begin{lstlisting}[style=fortran,caption={SOSCF / Delta-SCF fields on the DFTB+ run-state struct (\texttt{initprogram.F90}).}]
+! --- DeltaSCF block ---
+logical  :: tDeltaScf            = .false.   ! enables pre-SOSCF or standalone Delta-SCF
+logical  :: deltaScfIsFixedEta   = .false.   ! .true. if ShiftEnergy given; .false. if ShiftMargin
+real(dp) :: deltaScfShiftEnergy  = 0.0_dp    ! Ha; used only when deltaScfIsFixedEta = .true.
+real(dp) :: deltaScfShiftMargin  = 0.1_dp    ! Ha; epsilon' in eta = |HOMO-LUMO gap| + margin
+logical  :: deltaScfUseMixer     = .false.   ! Broyden/DIIS in pre-SOSCF and standalone Delta-SCF
+logical  :: deltaScfUseIMOM      = .true.    ! IMOM in pre-SOSCF; also gates IMOM vs MOM in SOSCF
+integer, allocatable :: deltaScfExcitedFrom_alpha(:), deltaScfExcitedTo_alpha(:)
+integer, allocatable :: deltaScfExcitedFrom_beta(:),  deltaScfExcitedTo_beta(:)
+
+! --- SOSCF block ---
+logical  :: tSoscf               = .false.   ! enables runSoscfLoop after pre-SOSCF
+real(dp) :: soscfThreshold       = 1.0e-4_dp ! max|g| threshold (handoff + final)
+real(dp) :: soscfOuterSccTol     = 1.0e-8_dp ! charge convergence in SOSCF outer loop
+logical  :: soscfVerbose         = .false.   ! write soscf.out per-iter diagnostics
+logical  :: soscfUseMixer        = .false.   ! Broyden/DIIS in SOSCF outer loop
+logical  :: soscfUseMaxKappa     = .true.    ! enable trust-region clip
+real(dp) :: soscfMaxKappa        = 0.5_dp    ! cap in rad
+type(TSoscf) :: soscf
+integer, allocatable :: soscfExcitedFrom_alpha(:), soscfExcitedTo_alpha(:)
+integer, allocatable :: soscfExcitedFrom_beta(:),  soscfExcitedTo_beta(:)
+\end{lstlisting}
+
+\subsection{Key subroutines}
+
+\paragraph{In \texttt{dftb/soscf.F90}.}
+A new module encapsulating the quasi-Newton machinery:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Routine & Purpose \\
+\midrule
+\texttt{soscf\_init} & Allocate per-spin arrays; build occ/virt partition from target filling; \\
+& initialise diagonal inverse Hessian per Eq.~\eqref{eq:invH-init}; store $\kappa_\mathrm{max}$. \\
+\texttt{computeOrbGradient} & $g_{ia} = 4\,[\CC^\top \FF\CC]_{ia}$ for given eigvecs and AO Fock. \\
+\texttt{getSoscfStep} & Compute $\mathrm{D}\xx=-\HH^{-1}\gg$; apply trust-region clip if enabled. \\
+\texttt{buildKappa} & Assemble antisymmetric $\kkappa$ from the flattened $\mathrm{D}\xx$. \\
+\texttt{computeCayleyExp} & Cayley form $\UU=(\II-\tfrac12\kkappa)^{-1}(\II+\tfrac12\kkappa)$ via LAPACK gesv. \\
+\texttt{updateInvHessianLSR1} & SR1 rank-1 update~\eqref{eq:lsr1} with two safety guards. \\
+\texttt{getInvHessDiag} & Return diagonal of $\HH^{-1}$ (diagnostic). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{In \texttt{dftbplus/main.F90}.}
+The driver adds:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Routine & Purpose \\
+\midrule
+\texttt{runPreSoscfDeltaScfLoop} & Pre-SOSCF Delta-SCF loop; exits on $\max|g|<\vartheta_\mathrm{SOSCF}$ (Alg.~\ref{alg:deltaScf}). Called when \texttt{tSoscf = .true.}. \\
+\texttt{runDeltaScfStandaloneLoop} & Standalone Delta-SCF loop (no SOSCF handoff); exits on $\mathrm{sccErrorQ}<\mathtt{SCCTolerance}$ (same criterion as GS SCC). Called when \texttt{tSoscf = .false.}. \\
+\texttt{runSoscfLoop}    & SOSCF outer loop, one Newton rotation per iter (Alg.~\ref{alg:soscf}). \\
+\texttt{buildDeltaScfTargetFilling} & Construct $f^{(\mathrm{T})}$ from GS filling and Excited indices. \\
+\texttt{computeDeltaScfEta} & Automatic $\eta = (\varepsilon_\mathrm{LUMO}^\mathrm{GS}-\varepsilon_\mathrm{HOMO}^\mathrm{GS})+\varepsilon'$ per Eq.~\eqref{eq:stepEta}. \\
+\texttt{buildAndDiagDeltaScfRealHam} & Form $\FF+\eta\,\SS\mathbf{Q}\SS$ and solve generalised eigenproblem per Eq.~\eqref{eq:step}. \\
+\texttt{restoreDeltaScfEigenvalues} & Subtract $\eta$ from the eigenvalues whose filling indicates virtual ($f<1/2$). \\
+\texttt{getIMOMTargetFilling} & Greedy max-overlap filling reassignment (\S\ref{sec:imom}); used both by pre-SOSCF and by \texttt{runSoscfLoop} as IMOM (frozen reference) or MOM (advancing reference). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{In \texttt{dftbplus/mainio.F90}.}
+Output helpers:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Routine & Purpose \\
+\midrule
+\texttt{printSoscfHeader}   & stdout 5-column header: iSCC $|$ $E_\mathrm{elec}$ $|$ $\Delta E$ $|$ SCC error $|$ $\max|g|$. \\
+\texttt{printSoscfInfo}     & stdout per-iter row with the five quantities. \\
+\texttt{writeSoscfHeader}   & Initialise verbose soscf.out. \\
+\texttt{writeSoscfIter}     & Per-iter block in soscf.out (summary + per-orbital eigvec coefficients). \\
+\texttt{writeSoscfRotDiag}  & Rotation diagnostics: L-SR1 flags, $\|\bm{\delta}\|$, $\|\bm{\gamma}\|$, denominator, $\max|\kkappa|$. \\
+\texttt{writeSoscfPostRotDiag} & Post-rotation eigvectors with IMOM-assigned occupation. \\
+\texttt{writeSoscfMomDiag}  & Pre/post IMOM filling and eigvec diagnostic block. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Output files}
+
+\paragraph{stdout (the \texttt{log} file).}
+Three iteration tables are printed sequentially:
+\begin{enumerate}
+\item Ground-state SCC (4-column: iSCC, $E_\mathrm{elec}$, $\Delta E$, SCC error).
+\item Pre-SOSCF Delta-SCF (5-column with $\max|g|$ when SOSCF is active):
+\begin{lstlisting}[style=hsd,numbers=none]
+  Delta-SCF (pre-SOSCF) charge update: direct substitution (no mixer).
+  Delta-SCF (pre-SOSCF) orbital tracking: IMOM (reference = GS eigvecs).
+ iSCC Total electronic   Diff electronic      SCC error          max|g|
+    1   -0.413608E+01    0.000000E+00    0.594E+00    0.000000E+00
+    2   -0.353248E+01    0.603596E+00    0.092E-01    0.098371E+00
+    ...
+  SOSCF orbital tracking: IMOM (reference frozen at pre-SOSCF eigvecs).
+\end{lstlisting}
+\item SOSCF outer (same 5-column header; banner lines before are the
+three lines below, each switching on the corresponding keyword —
+\texttt{UseIMOM}, \texttt{UseMixer}, \texttt{UseMaxKappa}):
+\begin{lstlisting}[style=hsd,numbers=none]
+  SOSCF orbital tracking: IMOM (reference frozen at pre-SOSCF eigvecs).
+                          # or "MOM (reference updated each outer iter)." when UseIMOM = No
+  SOSCF charge update:    direct substitution (no mixer).
+                          # or "Broyden/DIIS mixer." when UseMixer = Yes
+  SOSCF step cap:         max|kappa| clipped to  0.500 rad (trust-region).
+                          # or "disabled (full Newton step)." when UseMaxKappa = No
+\end{lstlisting}
+The same pair of alternatives appears in the pre-SOSCF banner
+(\texttt{Delta-SCF (pre-SOSCF) orbital tracking: aufbau on
+level-shifted eigenvalues.} when \texttt{UseIMOM = No}).
+\end{enumerate}
+The final \texttt{Total Energy} line follows the SOSCF convergence.
+
+\paragraph{soscf.out (when \texttt{Verbosity = Yes}).}
+For every pre-SOSCF and SOSCF iteration:
+\begin{itemize}[leftmargin=*]
+\item One summary line: iIter, $E_\mathrm{elec}$, $\Delta E$, sccErrorQ, $\max|g|$ per spin;
+\item For each spin: the full eigenvalue / occupation / eigenvector-coefficient table;
+\item In the SOSCF phase, additionally per spin per iter: L-SR1 flags
+($\|\bm{\delta}\|, \|\bm{\gamma}\|$, denom, applied flag), max$|\kkappa|$,
+full occ--virt blocks of $g$, $\mathrm{D}x$, and $\kkappa$;
+\item IMOM pre/post-rotation diagnostics: \emph{Filling BEFORE IMOM},
+\emph{Filling AFTER IMOM}, reference and candidate eigvectors.
+\end{itemize}
+
+\paragraph{band.out.}
+Eigenvalues and fillings of the final converged state. After a SOSCF
+run \texttt{band.out} is written \emph{after} the post-SOSCF eigenvalue
+refresh $\varepsilon_i \gets \langle\CC_i|\FF|\CC_i\rangle$, so the
+reported values correspond self-consistently to the rotated MOs in
+\texttt{eigvecsReal}. The $(\varepsilon_i,f_i)$ pairs in
+\texttt{band.out} are additionally sorted ascending by $\varepsilon$
+(the internal arrays remain in IMOM order). For a standalone
+Delta-SCF run \texttt{band.out} is written from the converged
+level-shifted eigenvalues directly, without the SOSCF refresh and
+without sorting.
+
+\paragraph{detailed.out, charges.bin.}
+Standard DFTB+ outputs, using (in SOSCF mode) the refreshed eigenvalues
+and IMOM-tracked filling in the internal (unsorted) order.
+
+\subsection{Convergence criteria}
+
+Let $\vartheta_\mathrm{g}\equiv\vartheta_\mathrm{SOSCF}=\mathtt{SOSCF\,\{\,Threshold\,\}}$
+and $\mathrm{sccErrorQ}\equiv\max_i|q^\mathrm{out}_i-q^\mathrm{in}_i|$.
+Three exit rules are in play, one per loop:
+
+\begin{equation}
+\text{Pre-SOSCF (\texttt{runPreSoscfDeltaScfLoop}) exit:}\quad
+\max_{ia}|g_{ia}| \,<\, \vartheta_\mathrm{g}.
+\label{eq:conv-preSOSCF}
+\end{equation}
+$\mathrm{sccErrorQ}$ is evaluated and printed per iter for diagnostics
+but is \emph{not} used as an exit condition here — charge
+self-consistency is the SOSCF outer loop's job.
+
+\begin{equation}
+\text{SOSCF (\texttt{runSoscfLoop}) converged:}\quad
+\mathrm{sccErrorQ}\,<\,\mathtt{OuterSCCTolerance}
+\;\text{\textbf{and}}\;
+\max_{ia}|g_{ia}| \,<\, \vartheta_\mathrm{g}.
+\label{eq:conv-SOSCF}
+\end{equation}
+Both the orbital gradient (stationary point on the rotation manifold)
+and the charge residual (self-consistent density at that stationary
+point) must be small simultaneously. The two quantities are now
+evaluated at \emph{different} states of the current outer iteration
+$n$, by design: $\max|\gg|$ is measured \emph{before} the rotation at
+$(\CC^{(n-1)},\FF[\qq^{(n-1),\mathrm{in}}])$ in Step~A, whereas
+$\mathrm{sccErrorQ}=\|\qq^\mathrm{out}(\CC^{(n)})-\qq^{(n-1),\mathrm{in}}\|_\infty$
+is measured \emph{after} the rotation in Step~B (post-rotation $\CC$
+against the $\qq^\mathrm{in}$ that built the Fock matrix used in
+Step~A). At convergence the last rotation has
+$\max|\kkappa|=O(\max|\gg|/\|\HH\|)$, so the one-rotation lag on the
+gradient is $O(\vartheta_\mathrm{SOSCF})$ --- below the convergence
+noise; see \S\ref{sec:algo-soscf}.
+
+\begin{equation}
+\text{Standalone (\texttt{runDeltaScfStandaloneLoop}) converged:}\quad
+\mathrm{sccErrorQ}\,<\,\mathtt{SCCTolerance}
+\;\;\text{(global SCC tolerance).}
+\label{eq:conv-standalone}
+\end{equation}
+This reproduces the behaviour of the ground-state SCC loop applied to
+the level-shifted fixed point; no gradient is computed.
+
+\subsection{Results on selected test cases}\label{sec:results-dblexc}
+
+Table~\ref{tab:results} summarises behaviour on three excitations of
+\ce{H2O} and formaldehyde:
+
+\begin{table}[ht]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Case & pre-SOSCF iters & SOSCF iters & $E_\mathrm{tot}$ (Ha) \\
+\midrule
+\ce{H2O}, HOMO$\to$LUMO                                     & 121 & 118 & $-3.4802356738$ \\
+\ce{H2CO}, HOMO-1$\to$LUMO                                  & 5   & 94  & $-5.4813054440$ \\
+\ce{H2CO}, $\{$HOMO-1,\,HOMO$\}\!\to\!\{$LUMO,\,LUMO+1$\}$  & 2   & 328 & $-4.7979030943$ \\
+\bottomrule
+\end{tabular}
+\caption{All cases use the current defaults (\texttt{UseIMOM=Yes},
+\texttt{UseMixer=No} for both blocks, \texttt{UseMaxKappa=Yes},
+\texttt{MaxKappa=0.5}~rad). The double excitation requires
+\texttt{MaxKappa=0.2} to converge; without the trust-region clip it
+diverges exponentially ($\max|g|>10^{77}$).}
+\label{tab:results}
+\end{table}
+
+The $\kappa_\mathrm{max}$ default of 0.5~rad is inactive for the first
+two cases (natural Newton step is well below 0.5~rad once SOSCF is in
+its convergence regime). Double excitations and other high-order
+saddles may require tightening to 0.2~rad.
+
+%=====================================================================
+\section{Summary}
+
+The implementation delivers a second-order SCF method for excited
+states in DFTB+ built around four interacting ingredients:
+\begin{enumerate}[leftmargin=*]
+\item Level-shift Delta-SCF (STEP) for a warm start to the excited
+saddle;
+\item IMOM greedy-overlap orbital tracking that stabilises non-aufbau
+character under SCC drift;
+\item Quasi-Newton step via L-SR1 inverse-Hessian update with the
+correct saddle-seeking signed Newton direction;
+\item Cayley-form orbital rotation \eqref{eq:cayley} guaranteeing
+orthonormality, together with a trust-region cap
+\eqref{eq:trust-cap} that prevents catastrophic overshoot on high-order
+saddles.
+\end{enumerate}
+The input is controlled by the \texttt{DeltaSCF\{\dots\}} and
+\texttt{SOSCF\{\dots\}} blocks inside the \texttt{Hamiltonian=DFTB} HSD
+block; outputs include an extended stdout iteration log with a
+$\max|g|$ column, the detailed per-iter diagnostic file \texttt{soscf.out},
+and a refreshed \texttt{band.out} self-consistent with the post-rotation
+MOs.
+
+\subsection*{Full pseudocode}
+\addcontentsline{toc}{subsection}{Full pseudocode}
+
+Algorithm~\ref{alg:full} below lists the complete driver at one level
+of detail, making explicit what each step updates. Throughout the
+listing, $\qq$ denotes the (reduced) charge vector,
+$\CC$ the MO coefficients, $\bm{\varepsilon}$ the eigenvalues,
+$f$ the occupation array, $\FF$ the AO Fock/Hamiltonian,
+$\SS$ the AO overlap, $\gg$ the orbital gradient,
+$\HH^{-1}$ the approximate inverse orbital Hessian, and
+$\mathrm{D}\xx$ the quasi-Newton step in the flattened occ--virt
+parameter space.
+
+The full driver is shown in Algorithms~\ref{alg:full-init}--\ref{alg:full-SOSCF},
+one algorithm per phase group to keep each block on a single page.
+
+\medskip
+
+\textbf{Input.} Geometry, basis, user-specified
+\texttt{ExcitedFrom} / \texttt{ExcitedTo} indices, level-shift parameter
+($\eta$ or $\varepsilon'$), thresholds $\mathtt{SCCTolerance}$,
+$\vartheta_\mathrm{SOSCF}$, $\mathtt{OuterSCCTolerance}$, flags
+\texttt{tSoscf}, \texttt{UseIMOM}, \texttt{UseMixer}, \texttt{UseMaxKappa}.\\
+\textbf{Output.} Converged $(\CC, \bm{\varepsilon}, f, \qq, E)$
+and files \texttt{band.out} / \texttt{detailed.out} / \texttt{charges.bin}.
+
+\begin{algorithm}[H]
+\caption{Phases 0--1: ground-state SCC and target-filling setup.}
+\label{alg:full-init}
+\footnotesize
+\begin{algorithmic}[1]
+
+\State \textbf{Phase 0 --- Ground-state SCC.}
+\State Initialise $\qq^{(0)}\gets\qq^{0}$ (neutral-atom reference).
+\For{$k=1,2,\dots,\mathrm{MaxSCC}$}
+  \State Build $\FF[\qq^{(k-1)}]$ from Eq.~\eqref{eq:dftbH}.
+  \State Solve $\FF\,\CC=\SS\,\CC\,\bm{\varepsilon}$ $\to$ $(\CC,\bm{\varepsilon})$.
+  \State Apply Aufbau $\to$ $f$; form $\mathbf{P}$; compute $\qq^{\mathrm{out}}$ (Eq.~\eqref{eq:mulliken}).
+  \If{$\|\qq^{\mathrm{out}}-\qq^{(k-1)}\|_\infty<\mathtt{SCCTolerance}$}\ \textbf{break} \EndIf
+  \State $\qq^{(k)}\gets\mathrm{Mixer}(\qq^{(k-1)},\qq^{\mathrm{out}}-\qq^{(k-1)})$ \Comment{Broyden/DIIS}
+\EndFor
+\State Save GS state: $(\CC^{(\mathrm{GS})},\bm{\varepsilon}^{(\mathrm{GS})},\qq^{(\mathrm{GS})})\gets(\CC,\bm{\varepsilon},\qq)$.
+
+\Statex
+
+\State \textbf{Phase 1 --- Build non-Aufbau target filling.}
+\State $f^{(\mathrm{T})} \gets f^{(\mathrm{GS})}$; set $f^{(\mathrm{T})}_r=0$ for $r\in\mathtt{ExcitedFrom}$, $f^{(\mathrm{T})}_r=1$ for $r\in\mathtt{ExcitedTo}$ (per spin).
+\State Determine level shift once: $\eta\gets\mathtt{ShiftEnergy}$,
+       \textbf{or} $\eta = \varepsilon_\mathrm{LUMO}^{(\mathrm{GS})}-\varepsilon_\mathrm{HOMO}^{(\mathrm{GS})}+\varepsilon'$.
+
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Phase 2: level-shifted Delta-SCF. Exactly one of 2a or 2b runs,
+selected by \texttt{tSoscf}.}
+\label{alg:full-deltaSCF}
+\footnotesize
+\begin{algorithmic}[1]
+
+\If{\textbf{not} \texttt{tSoscf}} \Comment{Standalone Delta-SCF branch}
+  \State \textbf{Phase 2a --- runDeltaScfStandaloneLoop.}
+  \If{\texttt{UseIMOM}} $\CC^{(\mathrm{ref})}\gets\CC^{(\mathrm{GS})}$;\ $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$. \EndIf
+  \State $f\gets f^{(\mathrm{T})}$;\ $\qq^{(0)}\gets\qq^{(\mathrm{GS})}$.
+  \For{$k=1,2,\dots,\mathrm{MaxSCC}$}
+    \State \textbf{[shift]} Form $\mathbf{Q}=\sum_{a\in\mathrm{virt}(f)}\CC_{:,a}\CC_{:,a}^{\top}$; solve $(\FF[\qq^{(k-1)}]+\eta\,\SS\mathbf{Q}\SS)\CC=\SS\,\CC\,\widehat{\bm{\varepsilon}}$.
+    \State \textbf{[fill]} Aufbau on $\widehat{\bm{\varepsilon}}$ $\to$ $f$; \textbf{if} \texttt{UseIMOM} reassign $f$ by max-overlap.
+    \State \textbf{[restore]} $\varepsilon_a\gets\widehat{\varepsilon}_a-\eta$ for $a\in\mathrm{virt}(f)$.
+    \State \textbf{[charges]} Build $\mathbf{P}$; $\qq^{\mathrm{out}}\gets\mathrm{Mulliken}$; $\mathrm{sccErrorQ}\gets\|\qq^{\mathrm{out}}-\qq^{(k-1)}\|_\infty$.
+    \If{$\mathrm{sccErrorQ}<\mathtt{SCCTolerance}$}\ \textbf{break (done)} \EndIf
+    \State $\qq^{(k)}\gets\mathrm{Mixer}(\qq^{(k-1)},\qq^{\mathrm{out}}-\qq^{(k-1)})$ if \texttt{UseMixer} \textbf{else} $\qq^{(k)}\gets\qq^{\mathrm{out}}$.
+  \EndFor
+  \State \textbf{goto Phase 4} (skip SOSCF).
+\Else
+
+  \Statex
+  \State \textbf{Phase 2b --- runPreSoscfDeltaScfLoop.} \Comment{warm start for SOSCF}
+  \If{\texttt{UseIMOM}} $\CC^{(\mathrm{ref})}\gets\CC^{(\mathrm{GS})}$;\ $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$. \EndIf
+  \State $f\gets f^{(\mathrm{T})}$;\ $\qq^{(0)}\gets\qq^{(\mathrm{GS})}$.
+  \For{$k=1,2,\dots,\mathrm{MaxSCC}$}
+    \State \textbf{[shift]} solve $(\FF[\qq^{(k-1)}]+\eta\,\SS\mathbf{Q}\SS)\CC=\SS\,\CC\,\widehat{\bm{\varepsilon}}$ \ ($\mathbf{Q}$ from current $f$).
+    \State \textbf{[fill]} Aufbau on $\widehat{\bm{\varepsilon}}$ $\to$ $f$; \textbf{if} \texttt{UseIMOM} reassign $f$ by max-overlap.
+    \State \textbf{[restore]} $\varepsilon_a\gets\widehat{\varepsilon}_a-\eta$ for $a\in\mathrm{virt}(f)$.
+    \State \textbf{[gradient]} $g_{ia}\gets 4\,[\CC^{\top}\FF[\qq^{(k-1)}]\CC]_{ia}$ on occ--virt.
+    \If{$\max_{ia}|g_{ia}|<\vartheta_\mathrm{SOSCF}$}\ \textbf{break (handoff)} \EndIf
+    \State \textbf{[charges]} Build $\mathbf{P}$; $\qq^{\mathrm{out}}\gets\mathrm{Mulliken}$; compute $\mathrm{sccErrorQ}$ (diagnostic only).
+    \State $\qq^{(k)}\gets\mathrm{Mixer}(\qq^{(k-1)},\qq^{\mathrm{out}}-\qq^{(k-1)})$ if \texttt{UseMixer} \textbf{else} $\qq^{(k)}\gets\qq^{\mathrm{out}}$.
+  \EndFor
+  \State $f^{(\mathrm{T})}\gets f$ \Comment{final IMOM-tracked filling handed to SOSCF}
+
+\EndIf
+
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Phase 3--4: SOSCF outer loop (skipped if Phase 2a ran) and
+output.}
+\label{alg:full-SOSCF}
+\footnotesize
+\begin{algorithmic}[1]
+
+\State \textbf{Phase 3 --- runSoscfLoop.}
+\State \texttt{soscf\_init}: partition occ/virt via $f^{(\mathrm{T})}$; set
+$\HH^{-1}\gets\mathrm{diag}\!\big(\mathrm{sign}(\Delta_{ia})/\max(2|\Delta_{ia}|,10^{-3})\big)$
+with $\Delta_{ia}=\varepsilon_a-\varepsilon_i$ (Eq.~\eqref{eq:invH-init}).
+\State Initialise tracking reference: $\CC^{(\mathrm{ref})}\gets\CC$,\ $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$.
+\State Zero history: $\gg_{\mathrm{prev}}\gets 0$,\ $\mathrm{D}\xx_{\mathrm{prev}}\gets 0$.
+\State Reset Broyden/DIIS mixer once (if \texttt{UseMixer}). $\qq^{(0)}\gets$ charges from end of Phase 2b.
+\For{$n=1,2,\dots,\mathrm{MaxSCC}$}
+  \Statex\quad\textit{Step A --- one Newton rotation at rebuilt $\FF[\qq^{(n-1)}]$.}
+  \State Rebuild $\FF\gets\FF[\qq^{(n-1)}]$ from the current input charges.
+  \For{each spin channel}
+    \State $\gg\gets 4\,[\CC^{\top}\FF\,\CC]_{ia}$.
+    \If{$n>1$}
+      \State $\bm{\gamma}\gets\gg-\gg_{\mathrm{prev}}$,\ $\bm{\delta}\gets\mathrm{D}\xx_{\mathrm{prev}}$,\ $\bm{j}\gets\bm{\delta}-\HH^{-1}\bm{\gamma}$.
+      \If{safeguards pass} $\HH^{-1}\gets\HH^{-1}+\bm{j}\bm{j}^{\top}/(\bm{j}^{\top}\bm{\gamma})$ \EndIf\Comment{Eq.~\eqref{eq:lsr1}}
+    \EndIf
+    \State $\gg_{\mathrm{prev}}\gets\gg$; \ $\mathrm{D}\xx\gets-\HH^{-1}\gg$; clip to $\kappa_\mathrm{max}$ if \texttt{UseMaxKappa}; \ $\mathrm{D}\xx_{\mathrm{prev}}\gets\mathrm{D}\xx$.
+    \State Build antisymmetric $\kkappa$; form $\UU=(\II-\tfrac12\kkappa)^{-1}(\II+\tfrac12\kkappa)$; rotate $\CC\gets\CC\,\UU$.
+    \State Reassign $f^{(\mathrm{T})}$ by max-overlap of $\CC$ against $(\CC^{(\mathrm{ref})},f^{(\mathrm{ref})})$.
+  \EndFor
+  \If{\textbf{not} \texttt{UseIMOM}} $\CC^{(\mathrm{ref})}\gets\CC$,\ $f^{(\mathrm{ref})}\gets f^{(\mathrm{T})}$. \EndIf \Comment{MOM reference advance}
+
+  \Statex\quad\textit{Step B --- density, charges and energies at the post-rotation $\CC$.}
+  \State Build $\mathbf{P}$ from $\CC$ and $f^{(\mathrm{T})}$; $\qq^{\mathrm{out}}\gets\mathrm{Mulliken}$.
+  \State Evaluate total electronic energy $E_\mathrm{elec}$ at the rotated state (\texttt{calcEnergies}, \texttt{sumEnergies}).
+  \State $\mathrm{sccErrorQ}\gets\|\qq^{\mathrm{out}}-\qq^{(n-1)}\|_\infty$.
+  \State $\qq^{(n)}\gets\mathrm{Mixer}(\qq^{(n-1)},\qq^{\mathrm{out}}-\qq^{(n-1)})$ if \texttt{UseMixer} \textbf{else} $\qq^{(n)}\gets\qq^{\mathrm{out}}$. \Comment{feeds Step~A of iter $n{+}1$}
+
+  \Statex\quad\textit{Step C --- convergence check.}
+  \If{$\mathrm{sccErrorQ}<\mathtt{OuterSCCTolerance}$ \textbf{and} $\max|\gg|<\vartheta_\mathrm{SOSCF}$}\ \textbf{break} \EndIf
+\EndFor
+\State \textbf{Refresh eigenvalues:} $\varepsilon_i\gets\langle\CC_i|\FF|\CC_i\rangle$.
+
+\Statex
+
+\State \textbf{Phase 4 --- Output.} Write \texttt{band.out} (sorted by $\varepsilon$ after SOSCF; unsorted otherwise), \texttt{detailed.out}, \texttt{charges.bin} from $(\CC,\bm{\varepsilon},f^{(\mathrm{T})},\qq)$.
+\end{algorithmic}
+\end{algorithm}
+
+The three principal state variables evolving across the driver are
+therefore:
+\begin{itemize}[leftmargin=*,nosep]
+\item \textbf{$\qq$} — updated once per SCC/SOSCF outer iteration by
+Mulliken analysis plus (optional) Broyden/DIIS mixing; carries the
+self-consistent density.
+\item \textbf{$(\CC,f)$} — updated by \emph{diagonalisation} of the
+level-shifted $\FF$ during GS SCC and Delta-SCF phases, and by
+\emph{orbital rotation} $\CC\gets\CC\,\UU$ inside the SOSCF outer
+loop; the filling $f$ is set by Aufbau and then (optionally) overridden
+by IMOM/MOM overlap matching.
+\item \textbf{$\HH^{-1}$} — initialised diagonally from the signed
+occ--virt eigenvalue gaps and refined by the L-SR1 rank-1 update once
+per SOSCF outer iteration.
+\end{itemize}
+
+%=====================================================================
+\begin{thebibliography}{9}
+
+\bibitem{FischerAlmlof1992}
+T.\ H.\ Fischer and J.\ Alml\"of,
+``General Methods for Geometry and Wave Function Optimization,''
+\emph{J.\ Phys.\ Chem.} \textbf{96}, 9768 (1992).
+
+\bibitem{Neese2000}
+F.\ Neese,
+``Approximate second-order SCF convergence for spin unrestricted
+wavefunctions,''
+\emph{Chem.\ Phys.\ Lett.} \textbf{325}, 93 (2000).
+
+\bibitem{Bacskay1981}
+G.\ B.\ Bacskay,
+``A quadratically convergent Hartree-Fock (QC-SCF) method.
+Application to closed shell systems,''
+\emph{Chem.\ Phys.} \textbf{61}, 385 (1981).
+
+\bibitem{HelgakerBook}
+T.\ Helgaker, P.\ J\o{}rgensen, J.\ Olsen,
+\emph{Molecular Electronic Structure Theory},
+Wiley, Chichester (2000).
+
+\bibitem{CarterFenkHerbert2020}
+K.\ Carter-Fenk and J.\ M.\ Herbert,
+``State-Targeted Energy Projection: A Simple and Robust Approach to
+Orbital Relaxation of Non-Aufbau Self-Consistent Field Solutions,''
+\emph{J.\ Chem.\ Theory Comput.} \textbf{16}, 5067 (2020).
+
+\bibitem{GilbertBesleyGill2008}
+A.\ T.\ B.\ Gilbert, N.\ A.\ Besley, P.\ M.\ W.\ Gill,
+``Self-consistent field calculations of excited states using the
+maximum overlap method (MOM),''
+\emph{J.\ Phys.\ Chem.\ A} \textbf{112}, 13164 (2008).
+
+\bibitem{Barca2018}
+G.\ M.\ J.\ Barca, A.\ T.\ B.\ Gilbert, P.\ M.\ W.\ Gill,
+``Simple Models for Difficult Electronic Excitations,''
+\emph{J.\ Chem.\ Theory Comput.} \textbf{14}, 1501 (2018).
+
+\bibitem{HaitHeadGordon2020}
+D.\ Hait and M.\ Head-Gordon,
+``Excited State Orbital Optimization via Minimizing the Square of the
+Gradient: General Approach and Application to Singly and Doubly
+Excited States,''
+\emph{J.\ Chem.\ Theory Comput.} \textbf{16}, 1699 (2020).
+
+\bibitem{NocedalWright}
+J.\ Nocedal and S.\ J.\ Wright,
+\emph{Numerical Optimization}, 2nd ed.,
+Springer, New York (2006).
+
+\bibitem{ConnGouldToint}
+A.\ R.\ Conn, N.\ I.\ M.\ Gould, P.\ L.\ Toint,
+\emph{Trust-Region Methods},
+MPS-SIAM, Philadelphia (2000).
+
+\bibitem{Elstner1998}
+M.\ Elstner, D.\ Porezag, G.\ Jungnickel, J.\ Elsner, M.\ Haugk, Th.\ Frauenheim,
+S.\ Suhai, G.\ Seifert,
+``Self-consistent-charge density-functional tight-binding method for simulations of
+complex materials properties,''
+\emph{Phys.\ Rev.\ B} \textbf{58}, 7260 (1998).
+
+\bibitem{DFTBplus}
+B.\ Hourahine \emph{et al.},
+``DFTB+, a software package for efficient approximate density
+functional theory based atomistic simulations,''
+\emph{J.\ Chem.\ Phys.} \textbf{152}, 124101 (2020).
+
+\end{thebibliography}
+
+\end{document}

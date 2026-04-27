@@ -1,0 +1,609 @@
+================================================================================
+  DFTB+ 24.1 — SOSCF excited-state SCF: full algorithm flow
+  Stages: (A) ground-state SCC → (B) pre-SOSCF Δ-SCF (level-shift + IMOM)
+                                  → (C) SOSCF outer loop (L-SR1 quasi-Newton)
+
+  Prepared as a drawing reference: every stage is given twice —
+    1. PSEUDOCODE  (math-level, for the abstract flowchart)
+    2. CODE FLOW   (subroutine names + key variables, for the
+                    implementation flowchart)
+================================================================================
+
+
+================================================================================
+TOP-LEVEL DISPATCH (processGeometry, main.F90:1254)
+================================================================================
+
+PSEUDOCODE
+----------
+   start
+     |
+     v
+   [Stage A: ground-state SCC loop]   exits on sccErrorQ < sccTol
+     |
+     v
+   tDeltaScf and tRealHS ?
+     |--- no  -----> done (GS only)
+     |
+     yes
+     |
+     v
+   tSoscf ?
+     |--- no  -----> [run standalone Δ-SCF]   exits on sccErrorQ < sccTol
+     |--- yes -----> [Stage B: pre-SOSCF Δ-SCF]   exits on max|g|<soscfThreshold
+                     |
+                     v
+                     [Stage C: SOSCF outer loop]  exits on
+                                                 sccErrorQ_outer<soscfOuterSccTol
+                                                 AND max|g|<soscfThreshold
+
+CODE FLOW
+---------
+   subroutine processGeometry  (main.F90)
+     |
+     v
+   lpSCC: do iSccIter = 1, this%maxSccIter      ! main.F90:1254
+     ... (Stage A body) ...
+     if (tConverged) exit lpSCC
+   end do lpSCC
+     |
+     v
+   if (this%tDeltaScf .and. this%tRealHS) then         ! main.F90:1371
+     if (this%tSoscf) then
+       call runPreSoscfDeltaScfLoop(env, this, ...)    ! main.F90:7733
+       call runSoscfLoop          (env, this, ...)    ! main.F90:8340
+     else
+       call runDeltaScfStandaloneLoop(env, this, ...) ! main.F90:8098
+     end if
+   end if
+
+
+================================================================================
+STAGE A — GROUND-STATE SCC (lpSCC, main.F90:1254)
+================================================================================
+
+PSEUDOCODE
+----------
+   initial qInput from neutral atoms (or read from charges.bin)
+   for iSccIter = 1 .. maxSccIter:
+       V        ← potential built from qInput
+       H_sparse ← H0 + V                      (Fock in sparse AO)
+       (eigen, eigvecs, filling, ρ) ← diagonalise H, S; aufbau
+       qOutput  ← Mulliken from ρ
+       Eelec    ← energy at qOutput
+       sccErrorQ ← max|qOutRed − qInpRed|
+       qInput   ← Broyden/DIIS mix of (qInput, qOutput)
+       if sccErrorQ < sccTol and iSccIter ≥ minSccIter: exit
+   end for
+   ===> on exit:
+        eigvecsReal       = GS MO coefficients C^GS
+        eigen             = GS orbital energies ε^GS
+        filling           = aufbau filling (ground-state occupation)
+        qInput = qOutput  = converged GS charges
+
+CODE FLOW
+---------
+   lpSCC: do iSccIter = 1, this%maxSccIter
+     call processPotentials   (env, this, iSccIter, .true.,
+                               this%qInput, this%qBlockIn, this%qiBlockIn)
+     call getSccHamiltonian   (env, this%H0, this%ints, ...,
+                               this%ints%hamiltonian, this%ints%iHamiltonian)
+     call convertToUpDownRepr (this%ints%hamiltonian, this%ints%iHamiltonian)
+     call getDensity          (env, ..., this%eigen, this%filling, this%rhoPrim,
+                               ..., this%HSqrReal, this%SSqrReal,
+                               this%eigvecsReal, ...)         ! diag + ρ
+     call processOutputCharges(env, this)
+     call processPotentials   (env, this, iSccIter+1, this%updateSccAfterDiag,
+                               this%qOutput, this%qBlockOut, this%qiBlockOut)
+     call calcEnergies        (env, this%scc, ..., this%qOutput, ...)
+     call processScc          (env, this, iGeoStep, iSccIter, sccErrorQ,
+                               tConverged, eOld, diffElec, tStopScc)
+     call sumEnergies         (this%dftbEnergy(this%deltaDftb%iDeterminant))
+     call sccLoopWriting      (this, iGeoStep, iLatGeoStep, iSccIter,
+                               diffElec, sccErrorQ)
+     if (tConverged .or. tStopScc) exit lpSCC
+   end do lpSCC
+
+   Key arrays / scalars carried out of Stage A into Stage B:
+     this%eigvecsReal(:,:,iSpin)  C^GS
+     this%eigen(:,1,iSpin)        ε^GS
+     this%filling(:,1,iSpin)      f^GS  (aufbau)
+     this%qInput, this%qOutput    converged GS charges
+     this%SSqrReal                last-used overlap (may be Cholesky factor)
+
+
+================================================================================
+STAGE B — PRE-SOSCF Δ-SCF (level shift + IMOM)
+              subroutine runPreSoscfDeltaScfLoop, main.F90:7733
+              EXIT CONDITION: max|g| < soscfThreshold      (NOT sccErrorQ!)
+================================================================================
+
+PSEUDOCODE
+----------
+   targetFilling ← swap occ/virt of f^GS at user-specified
+                   (excitedFrom_alpha → excitedTo_alpha)  [and beta if given]
+   η             ← shift energy (fixed = soscfShiftEnergy, or auto from gap)
+   if UseIMOM = Yes:
+       eigvecsRefDs ← C^GS                     (frozen GS reference for IMOM)
+       fillingRefDs ← targetFilling
+   reset Broyden mixer (only if DeltaSCF{UseMixer = Yes})
+
+   for iSccIter = 1 .. maxSccIter:
+       currentFilling ← (iSccIter==1 ? targetFilling : this%filling)
+       V        ← potential from qInput
+       H_sparse ← H0 + V
+       H'       ← H + η · S · C_virt · C_virt^T · S          ! level shift,
+                                                             ! C_virt from currentFilling
+       diagonalise H'  →  eigen', eigvecs   (eigvecsReal updated)
+       filling  ← aufbau on eigen'                            ! HOMO (virt) raised by η,
+                                                             ! aufbau picks LUMO instead
+       if UseIMOM = Yes:
+           filling ← maximum-overlap reassignment of filling
+                     against eigvecsRefDs            (greedy match by Cᵀ S Cref)
+       eigen    ← restoreDeltaScfEigenvalues(eigen', filling, η)
+                                            (subtract η at virtual positions)
+
+       # Pre-SOSCF gradient handoff check
+       compute g (orbital gradient) from physical H and current eigvecs
+       maxGPerSpin(iSpin) ← max|g|
+       if all spins have max|g| < soscfThreshold AND iSccIter ≥ minSccIter:
+           tExitForSoscf ← .true.
+
+       ρ        ← C · diag(filling) · Cᵀ        (via S)
+       qOutput  ← Mulliken from ρ
+       Eelec    ← energy at qOutput
+       sccErrorQ ← max|qOutRed − qInpRed|        (diagnostic only)
+       qInput   ← (UseMixer? Broyden : direct copy from qOutput)
+
+       if tExitForSoscf or tStopScc: exit
+   end for
+   ===> on exit:
+        eigvecsReal     = level-shifted excited-state MOs C^pre
+        eigen           = restored (physical) eigenvalues ε^pre
+        filling         = excited-state occupation (IMOM-tracked if UseIMOM)
+        qInput          = best available input charges for SOSCF
+
+CODE FLOW
+---------
+   subroutine runPreSoscfDeltaScfLoop (main.F90:7733)
+     ! ---- one-time setup ----------------------------------------------------
+     call buildDeltaScfTargetFilling(this%filling, ..., this%deltaScfExcitedFrom_alpha,
+                                     this%deltaScfExcitedTo_alpha, targetFilling, ...)
+     call computeDeltaScfEta        (this%eigen, this%filling, ...,
+                                     this%deltaScfIsFixedEta, this%deltaScfShiftEnergy,
+                                     this%deltaScfShiftMargin, eta)
+     if (this%deltaScfUseMixer) call reset(this%pChrgMixer, this%nMixElements)
+     if (this%deltaScfUseIMOM) then
+        eigvecsRefDs(:,:,:) = this%eigvecsReal(:,:,:)   ! GS reference (frozen)
+        fillingRefDs(:,:,:) = targetFilling(:,:,:)
+     end if
+     call printSoscfHeader(); if (soscfVerbose) call writeSoscfHeader(soscfOut, nSpin)
+
+     lpSCC_DeltaScf: do iSccIter = 1, this%maxSccIter
+       ! (a)–(b) build Fock from qInput
+       if (iSccIter == 1) currentFilling = targetFilling
+       else               currentFilling = this%filling
+       call processPotentials      (env, this, iSccIter, .true.,
+                                    this%qInput, this%qBlockIn, this%qiBlockIn)
+       call getSccHamiltonian      (env, this%H0, this%ints, ...,
+                                    this%ints%hamiltonian, this%ints%iHamiltonian)
+       call convertToUpDownRepr    (this%ints%hamiltonian, this%ints%iHamiltonian)
+
+       ! (c) level-shifted diagonalisation
+       call buildAndDiagDeltaScfRealHam(env, this%denseDesc, this%ints, ...,
+                                        currentFilling, eta,
+                                        this%HSqrReal, this%SSqrReal,
+                                        this%eigvecsReal, this%eigen, errStatus)
+
+       ! (d) aufbau on level-shifted ε  → this%filling
+       call getFillingsAndBandEnergies(this%eigen, this%nEl, this%nSpin, ...,
+                                       this%Ef, this%filling, ...)
+
+       ! (d') IMOM override of aufbau
+       if (this%deltaScfUseIMOM) then
+         call unpackHS    (this%SSqrReal, this%ints%overlap, ...)
+         call symmetrizeHS(this%SSqrReal)
+         do iSpin = 1, this%nSpin
+           call getIMOMTargetFilling(eigvecsRefDs(:,:,iSpin:iSpin),
+                                     this%eigvecsReal(:,:,iSpin:iSpin),
+                                     this%SSqrReal, this%filling,
+                                     this%nOrb, this%nSpin, 1,
+                                     this%parallelKS%localKS(:, iSpin:iSpin),
+                                     fillingRefDs)
+         end do
+       end if
+
+       ! (e) restore physical eigenvalues
+       call restoreDeltaScfEigenvalues(this%eigen, this%filling, eta,
+                                       this%nOrb, this%nSpin)
+
+       ! (e2) gradient handoff check  -- the ONLY exit criterion
+       do iSpinCheck = 1, this%nSpin
+         call unpackHS    (HphysReal, this%ints%hamiltonian(:, iSpinCheck), ...)
+         call symmetrizeHS(HphysReal)
+         build occTmp / virtTmp from this%filling > 0.5
+         call computeOrbGradient(this%eigvecsReal(:,:,iSpinCheck), HphysReal,
+                                 this%nOrb, occTmp, virtTmp,
+                                 nOccSpin, nVirtSpin, gTmp)
+         maxGPerSpin(iSpinCheck) = maxval(abs(gTmp))
+       end do
+       if (all maxGPerSpin < this%soscfThreshold) tExitForSoscf = .true.
+
+       ! (f)–(k) density, charges, energies at the level-shifted state
+       recompute Eband from restored eigen + filling
+       call getDensityFromRealEigvecs(env, this%denseDesc, this%filling(:,1,:), ...,
+                                      this%eigvecsReal, this%parallelKS,
+                                      this%rhoPrim, this%SSqrReal, ...)
+       call ud2qm                    (this%rhoPrim)
+       call processOutputCharges     (env, this)
+       call processPotentials        (env, this, iSccIter+1, this%updateSccAfterDiag,
+                                      this%qOutput, this%qBlockOut, this%qiBlockOut)
+       call calcEnergies             (env, this%scc, ..., this%qOutput, ...)
+       call sumEnergies              (this%dftbEnergy(this%deltaDftb%iDeterminant))
+
+       ! (l) charge update — direct sub. (default) or Broyden/DIIS
+       call reduceCharges (this%orb, ..., this%qOutput, this%qOutRed, ...)
+       sccErrorQ = maxval(abs(this%qOutRed - this%qInpRed))     ! diagnostic only
+       if (this%deltaScfUseMixer) then
+         qDiffRedDs = this%qOutRed - this%qInpRed
+         call mix(this%pChrgMixer, this%qInpRed, qDiffRedDs)
+         call expandCharges(this%qInpRed, ..., this%qInput, ...)
+       else
+         this%qInpRed   = this%qOutRed
+         this%qInput    = this%qOutput
+       end if
+
+       call printSoscfInfo(iSccIter, Eelec, diffElec, sccErrorQ, max(maxGPerSpin))
+       if (this%soscfVerbose) call writeSoscfIter(soscfOut, ..., "pre-SOSCF")
+       call sccLoopWriting (this, iGeoStep, iLatGeoStep, iSccIter,
+                            diffElec, sccErrorQ)
+       if (tExitForSoscf .or. tStopScc) exit lpSCC_DeltaScf
+     end do lpSCC_DeltaScf
+   end subroutine runPreSoscfDeltaScfLoop
+
+
+================================================================================
+STAGE C — SOSCF OUTER LOOP (subroutine runSoscfLoop, main.F90:8340)
+              EXIT CONDITION:
+                sccErrorQ_outer < soscfOuterSccTol
+                AND max|g| < soscfThreshold
+              ONE quasi-Newton orbital rotation per outer iter.
+              No diagonalisation inside the loop.
+================================================================================
+
+PSEUDOCODE
+----------
+   ! ---- Setup -------------------------------------------------------------
+   targetFilling ← this%filling                                ! from Stage B
+   for each spin:
+     occIdx, virtIdx ← partition by (targetFilling > 0.5)
+     invHess[k,k]    ← sign(ε_a − ε_i) / max(2|ε_a − ε_i|, 1e-3)   (signed gap)
+     gPrev ← 0,  DxPrev ← 0
+   eigvecsRef ← eigvecsReal,  fillingRef ← targetFilling       ! IMOM/MOM ref
+   reset Broyden mixer (only if SOSCF{UseMixer = Yes})
+
+   ! ---- Outer loop --------------------------------------------------------
+   for iOuterIter = 1 .. maxSccIter:
+
+     ! === Step A: build F(qIn), compute g, take ONE rotation ============
+     V        ← potential from qInput
+     H_sparse ← H0 + V                                          ! sparse Fock
+     for each spin:
+       Fao    ← unpack & symmetrise sparse Fock
+       F_MO   ← C^T · Fao · C
+       g(i,a) ← 4 · F_MO(occIdx(i), virtIdx(a))
+       maxG_step22 ← max(maxG_step22, max|g|)
+
+       if iOuterIter > 1:
+           γ       ← g − gPrev
+           j       ← DxPrev − invHess · γ
+           denom   ← jᵀ · γ
+           if ||DxPrev|| > 1e-5 and |denom| sufficient:
+               invHess ← invHess + j jᵀ / denom            ! L-SR1 update
+       gPrev ← g
+
+       Dx ← −invHess · g                                    ! Newton step
+       if useMaxKappa and max|Dx| > maxKappa:
+           Dx ← Dx · maxKappa / max|Dx|                     ! trust-region clip
+       DxPrev ← Dx
+
+       κ ← antisym matrix from Dx in (occ,virt) block
+       U ← (I − κ/2)^(−1) (I + κ/2)                         ! Cayley
+       C ← C · U                                            ! rotation
+
+       targetFilling ← MOM/IMOM reassignment(C, eigvecsRef, fillingRef, S)
+
+     if not UseIMOM:                                        ! MOM mode only
+       eigvecsRef ← C
+       fillingRef ← targetFilling
+
+     ! === Step B: density / charges / energy at the rotated C ===========
+     ρ        ← C · diag(targetFilling) · C^T               ! via S
+     qOutput  ← Mulliken from ρ
+     Eelec    ← evaluate at qOutput
+     sccErrorQ_outer ← max|qOutRed − qInpRed|
+
+     if SOSCF{UseMixer}:  qInput ← Broyden/DIIS(qInput, qOutput − qInput)
+     else:                qInput ← qOutput
+
+     ! === Step C: convergence ============================================
+     if sccErrorQ_outer < soscfOuterSccTol AND maxG_step22 < soscfThreshold:
+         exit
+   end for
+
+   ! ---- Post loop: refresh eigen for downstream output -------------------
+   for each spin:
+     ε_i ← <C_i | F | C_i>          ! diagonal of F_MO at the rotated C
+
+CODE FLOW
+---------
+   subroutine runSoscfLoop (main.F90:8340)
+
+     ! ---- one-time setup --------------------------------------------------
+     allocate(targetFilling(this%nOrb, 1, this%nSpin))
+     targetFilling(:,:,:) = this%filling(:,:,:)
+     call soscf_init   (this%soscf, this%nSpin, this%nOrb,
+                        this%eigen, targetFilling,
+                        this%soscfThreshold,
+                        this%soscfUseMaxKappa, this%soscfMaxKappa)
+       ! soscf_init (soscf.F90:122):
+       !   builds occIdx, virtIdx
+       !   allocates xVec, gPrev, DxPrev, invHess
+       !   sets invHess(k,k) = sign(gap) / max(2|gap|, 1e-3)
+
+     eigvecsRef(:,:,:) = this%eigvecsReal(:,:,:)            ! pre-SOSCF C
+     fillingRef(:,:,:) = targetFilling(:,:,:)
+
+     allocate(HphysReal, kappa, Urot, Cnew, qDiffRed, maxGPerSpinOuter)
+
+     if (this%soscfUseMixer .and. allocated(this%pChrgMixer))
+        call reset(this%pChrgMixer, this%nMixElements)
+     call printSoscfHeader()
+
+     ! ---- outer loop ------------------------------------------------------
+     lpSOSCF_Outer: do iOuterIter = 1, this%maxSccIter
+
+       !=== STEP A : build Fock, compute g, take one rotation =============
+       call processPotentials   (env, this, 1, .true.,
+                                 this%qInput, this%qBlockIn, this%qiBlockIn)
+       call getSccHamiltonian   (env, this%H0, this%ints, ...,
+                                 this%ints%hamiltonian, this%ints%iHamiltonian)
+       call convertToUpDownRepr (this%ints%hamiltonian, this%ints%iHamiltonian)
+
+       maxG_step22 = 0.0_dp
+       do iSpin = 1, this%nSpin
+         nOccSpin  = this%soscf%spin(iSpin)%nOcc
+         nVirtSpin = this%soscf%spin(iSpin)%nVirt
+         allocate(g, Dx, gammaSoscf  with length nOccSpin*nVirtSpin)
+
+         call unpackHS    (HphysReal, this%ints%hamiltonian(:, iSpin), ...)
+         call symmetrizeHS(HphysReal)
+
+         call computeOrbGradient(this%eigvecsReal(:,:,iSpin), HphysReal,
+                                 this%nOrb,
+                                 this%soscf%spin(iSpin)%occIdx,
+                                 this%soscf%spin(iSpin)%virtIdx,
+                                 nOccSpin, nVirtSpin, g)
+           ! computeOrbGradient (soscf.F90:242):
+           !   gemm(HC, Hao, eigvecs)
+           !   gemm(Fmo, eigvecs, HC, transA='T')
+           !   g(k) = 4 * Fmo(occIdx, virtIdx)
+
+         maxGPerSpinOuter(iSpin) = maxval(abs(g))
+         maxG_step22 = max(maxG_step22, maxGPerSpinOuter(iSpin))
+
+         if (iOuterIter > 1) then
+           gammaSoscf = g - this%soscf%spin(iSpin)%gPrev
+           call updateInvHessianLSR1(this%soscf%spin(iSpin),
+                                     this%soscf%spin(iSpin)%DxPrev, gammaSoscf,
+                                     lsr1DN, lsr1GN, lsr1Denom, lsr1Applied)
+             ! updateInvHessianLSR1 (soscf.F90:429):
+             !   gemv(jVec, sp%invHess, gamma, alpha=-1)
+             !   jVec  = delta + jVec    (= delta - H gamma)
+             !   denom = dot(jVec, gamma)
+             !   skip if ||delta|| < 1e-5 or |denom| degenerate
+             !   ger(sp%invHess, 1/denom, jVec, jVec)        ! H += jjᵀ/denom
+         end if
+         this%soscf%spin(iSpin)%gPrev = g
+
+         call getSoscfStep(this%soscf, this%soscf%spin(iSpin), g, Dx)
+           ! getSoscfStep (soscf.F90:299):
+           !   gemv(Dx, sp%invHess, g, alpha=-1, beta=0)         ! Dx = -H g
+           !   if useMaxKappa: Dx *= maxKappa / max|Dx| if needed (clip)
+         this%soscf%spin(iSpin)%DxPrev = Dx
+
+         call buildKappa     (Dx,
+                              this%soscf%spin(iSpin)%occIdx,
+                              this%soscf%spin(iSpin)%virtIdx,
+                              nOccSpin, nVirtSpin, this%nOrb, kappa)
+         call computeCayleyExp(kappa, this%nOrb, Urot)
+           ! computeCayleyExp (soscf.F90:376):
+           !   solves (I - kappa/2) U = (I + kappa/2) via gesv
+
+         allocate(Cold(this%nOrb, this%nOrb, 1))
+         Cold(:,:,1) = this%eigvecsReal(:,:,iSpin)
+         if (this%soscfVerbose) call writeSoscfRotDiag(soscfOut, ...)
+
+         call gemm(Cnew, Cold(:,:,1), Urot)                       ! C ← C · U
+         this%eigvecsReal(:,:,iSpin) = Cnew
+
+         call unpackHS    (this%SSqrReal, this%ints%overlap, ...)
+         call symmetrizeHS(this%SSqrReal)
+         call getIMOMTargetFilling(eigvecsRef(:,:,iSpin:iSpin),
+                                   this%eigvecsReal(:,:,iSpin:iSpin),
+                                   this%SSqrReal, targetFilling,
+                                   this%nOrb, this%nSpin, 1,
+                                   this%parallelKS%localKS(:, iSpin:iSpin),
+                                   fillingRef)
+         deallocate(Cold, g, Dx, gammaSoscf)
+       end do  ! spin
+
+       if (.not. this%deltaScfUseIMOM) then          ! MOM mode advances ref
+         eigvecsRef = this%eigvecsReal
+         fillingRef = targetFilling
+       end if
+
+       !=== STEP B : density / charges / energies at the rotated C ========
+       call unpackHS    (this%SSqrReal, this%ints%overlap, ...)
+       call symmetrizeHS(this%SSqrReal)
+       this%filling(:,:,:) = targetFilling(:,:,:)
+       call getDensityFromRealEigvecs(env, this%denseDesc, this%filling(:,1,:), ...,
+                                      this%eigvecsReal, this%parallelKS,
+                                      this%rhoPrim, this%SSqrReal, ...)
+       call ud2qm                    (this%rhoPrim)
+       call processOutputCharges     (env, this)
+       call processPotentials        (env, this, iOuterIter,
+                                      this%updateSccAfterDiag,
+                                      this%qOutput, this%qBlockOut, this%qiBlockOut)
+       call calcEnergies             (env, this%scc, ..., this%qOutput, ...)
+       call sumEnergies              (this%dftbEnergy(this%deltaDftb%iDeterminant))
+       call reduceCharges            (this%orb, ..., this%qOutput, this%qOutRed, ...)
+
+       sccErrorQ_outer = maxval(abs(this%qOutRed - this%qInpRed))
+
+       if (this%soscfUseMixer) then
+         qDiffRed = this%qOutRed - this%qInpRed
+         call mix(this%pChrgMixer, this%qInpRed, qDiffRed)
+       else
+         this%qInpRed = this%qOutRed
+       end if
+       call expandCharges(this%qInpRed, ..., this%qInput, ...)
+
+       !=== STEP C : convergence test + logging ============================
+       tConverged_outer = (sccErrorQ_outer < this%soscfOuterSccTol) .and. &
+                          (maxG_step22     < this%soscfThreshold ) .and. &
+                          (iOuterIter ≥ this%minSccIter
+                           .or. this%tReadChrg .or. iGeoStep > 0)
+
+       call getSccInfo   (iOuterIter, Eelec, eOld, diffElec)
+       call printSoscfInfo(iOuterIter, Eelec, diffElec,
+                          sccErrorQ_outer, maxG_step22)
+       if (this%soscfVerbose) call writeSoscfIter(soscfOut, ..., "SOSCF")
+       call sccLoopWriting(this, iGeoStep, iLatGeoStep, iOuterIter,
+                          diffElec, sccErrorQ_outer)
+
+       if (tConverged_outer .or. tStopScc) exit lpSOSCF_Outer
+     end do lpSOSCF_Outer
+
+     ! ---- post loop : refresh this%eigen at the rotated MOs --------------
+     do iSpin = 1, this%nSpin
+       call unpackHS    (HphysReal, this%ints%hamiltonian(:, iSpin), ...)
+       call symmetrizeHS(HphysReal)
+       call gemm(HC, HphysReal, this%eigvecsReal(:,:,iSpin))
+       do iOrb = 1, this%nOrb
+         this%eigen(iOrb,1,iSpin) = dot_product(this%eigvecsReal(:,iOrb,iSpin),
+                                                HC(:,iOrb))
+       end do
+     end do
+   end subroutine runSoscfLoop
+
+
+================================================================================
+KEY VARIABLES (cheat sheet for box labels)
+================================================================================
+
+GLOBAL (TDftbPlusMain  --  initprogram.F90 / inputdata.F90)
+  this%eigvecsReal(:,:,iSpin)       MO coefficients C in AO basis (nOrb,nOrb,nSpin)
+  this%eigen(:,1,iSpin)             orbital eigenvalues ε
+  this%filling(:,1,iSpin)           occupation numbers f
+  this%HSqrReal, this%SSqrReal      dense Fock / overlap (nOrb,nOrb)
+  this%ints%hamiltonian             sparse Fock
+  this%ints%overlap                 sparse overlap
+  this%rhoPrim, this%rhoSqrReal     density (sparse / dense)
+  this%qInput, this%qOutput         AO charges (nOrb-resolved)
+  this%qInpRed, this%qOutRed        symmetry-reduced charges (mixer input)
+  this%pChrgMixer                   Broyden / DIIS mixer object
+  this%nOrb, this%nSpin             dimensions
+  this%maxSccIter, this%minSccIter  loop bounds
+  this%sccTol                       GS-SCC tolerance
+  this%soscfThreshold               max|g| threshold (handoff & SOSCF)
+  this%soscfOuterSccTol             SOSCF outer charge tolerance
+  this%soscfUseMixer                SOSCF { UseMixer }
+  this%soscfUseMaxKappa             SOSCF { UseMaxKappa }
+  this%soscfMaxKappa                SOSCF { MaxKappa } (rad)
+  this%soscfVerbose                 dump soscf.out diagnostics
+  this%deltaScfUseIMOM              UseIMOM = Yes/No
+  this%deltaScfUseMixer             DeltaSCF { UseMixer }
+  this%deltaScfShiftEnergy          η (level shift)
+  this%deltaScfExcitedFrom_alpha    HOMO index of alpha hole
+  this%deltaScfExcitedTo_alpha      LUMO index of alpha particle
+  (...beta variants if open-shell)
+
+PRE-SOSCF Δ-SCF (runPreSoscfDeltaScfLoop locals)
+  targetFilling          excited-state filling at GS-orbital index (frozen)
+  currentFilling         filling that defines the level-shift virtual block
+  eta                    level shift η (Hartree)
+  eigvecsRefDs           frozen GS eigvecs reference for IMOM
+  fillingRefDs           companion filling for IMOM reference
+  HphysReal, gTmp        gradient handoff working arrays
+  maxGPerSpin            per-spin max|g|
+  tExitForSoscf          handoff flag
+
+SOSCF (TSoscf / TSoscfSpin  --  soscf.F90 + runSoscfLoop locals)
+  this%soscf%spin(iSpin)%nOcc / nVirt / nOccVirt  occ-virt sizes
+  this%soscf%spin(iSpin)%occIdx, virtIdx          1-based orbital indices
+  this%soscf%spin(iSpin)%xVec                     accumulated x (rotation vec)
+  this%soscf%spin(iSpin)%gPrev                    previous gradient
+  this%soscf%spin(iSpin)%DxPrev                   previous step δ for L-SR1
+  this%soscf%spin(iSpin)%invHess                  approx. inverse Hessian H
+  this%soscf%threshold                            soscfThreshold
+  this%soscf%useMaxKappa, %maxKappa               trust-region cap
+  g, Dx, gammaSoscf                               per-iter scratch
+  HphysReal                                       full-matrix Fock per spin
+  kappa, Urot, Cnew, Cold                         rotation workspace
+  eigvecsRef, fillingRef                          IMOM/MOM reference
+  maxG_step22, sccErrorQ_outer                    convergence indicators
+
+
+================================================================================
+SUBROUTINE INDEX (for quick lookup)
+================================================================================
+
+main.F90 (dftbplus-24.1/src/dftbp/dftbplus/main.F90)
+  processGeometry                       1254       top-level driver
+  lpSCC                                 1254       ground-state SCC loop
+  processPotentials                                build potential from charges
+  getSccHamiltonian                                build sparse H = H0 + V
+  convertToUpDownRepr                              spin-up/down split
+  getDensity                                       diag + ρ (GS path)
+  getDensityFromRealEigvecs                        ρ = C f Cᵀ via S
+  processOutputCharges                             Mulliken from ρ
+  calcEnergies / sumEnergies                       energy assembly
+  processScc                                       GS SCC convergence + mix
+  reduceCharges / expandCharges                    sym-reduce / un-reduce
+  mix (this%pChrgMixer, ...)                       Broyden / DIIS mixer
+  getSccInfo                                       diffElec
+  printSoscfHeader / printSoscfInfo                3-stage table output
+  writeSoscfHeader / writeSoscfIter / ...          soscf.out verbose
+  sccLoopWriting                                   detailed.out / band.out
+  hasStopFile                                      external stop signal
+
+main.F90  (Δ-SCF level-shift helpers)
+  runPreSoscfDeltaScfLoop               7733       handoff Δ-SCF (max|g|)
+  runDeltaScfStandaloneLoop             8098       no-SOSCF Δ-SCF (sccErrorQ)
+  runSoscfLoop                          8340       SOSCF outer loop
+  buildDeltaScfTargetFilling                       swap occ/virt to build target
+  computeDeltaScfEta                               η selection (fixed/auto)
+  buildAndDiagDeltaScfRealHam                      H' = H + η S Cv Cvᵀ S, diag
+  getFillingsAndBandEnergies                       aufbau on level-shifted ε
+  getIMOMTargetFilling                             max-overlap reassignment
+  restoreDeltaScfEigenvalues                       subtract η from ε at virtuals
+  symmetrizeHS                                     fill upper triangle of dense H/S
+  unpackHS                                         sparse → dense (lower tri only)
+
+soscf.F90 (dftbplus-24.1/src/dftbp/dftb/soscf.F90)
+  module dftbp_dftb_soscf            17
+  type TSoscfSpin                    59       per-spin state
+  type TSoscf                        94       top-level SOSCF state
+  soscf_init                        122       partition + diag invHess
+  computeOrbGradient                242       g = 4 * (Cᵀ F C)[occ,virt]
+  getSoscfStep                      299       Dx = -invH g + trust-region clip
+  buildKappa                        334       antisym matrix from Dx
+  computeCayleyExp                  376       U = (I-κ/2)⁻¹(I+κ/2) via gesv
+  updateInvHessianLSR1              429       L-SR1 rank-1 update
+  getInvHessDiag                    499       diagonal extraction (verbose)
+
+
+================================================================================
+END
+================================================================================
