@@ -1,0 +1,51 @@
+Geometry = xyzFormat{
+  <<< 'formaldehyde.xyz'
+}
+
+Hamiltonian = DFTB{
+  SCC = Yes
+  SCCTolerance = 1.0e-6
+  MaxSCCIterations = 300
+  Charge = 0
+  #Mixer = Simple{}
+  MaxAngularMomentum = {
+    C = 'p'
+    H = 's'
+    O = 'p'
+  }
+  SpinPolarisation = Colinear {}
+  SpinConstants = {
+    ShellResolvedSpin = Yes
+    H = { -0.072 }
+    C = { -0.031 -0.025 -0.025 -0.023 }
+    O = { -0.035 -0.030 -0.030 -0.028 }
+  }
+  SlaterKosterFiles = Type2FileNames{
+    Prefix = '/media/jhlee/SAMSUNG/jobs/21-overCPA/skfiles/mio/'
+    Separator = '-'
+    Suffix = '.skf'
+    LowerCaseTypeName = No
+  }
+  DeltaSCF = {
+    ShiftEnergy = 10.0
+    UseIMOM = Yes
+    UseMixer = No
+    ExcitedFrom_alpha = {6}
+    ExcitedTo_alpha = {7}
+  }
+}
+Analysis = {
+  PrintForces = No
+  WriteBandOut = Yes
+  WriteEigenvectors = Yes
+  MullikenAnalysis = Yes
+}
+Options = {
+  WriteDetailedOut = Yes
+  WriteDetailedXML = Yes
+  TimingVerbosity = -1
+}
+ParserOptions = {
+  ParserVersion = 14
+}
+

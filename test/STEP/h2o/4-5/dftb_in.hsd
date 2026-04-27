@@ -1,0 +1,44 @@
+Geometry = xyzFormat {
+  <<< "h2o.xyz"
+}
+#Driver = {}
+Hamiltonian = DFTB {
+  SCC = Yes
+  SCCTolerance = 1e-6
+  MaxSCCIterations = 200
+  SlaterKosterFiles = Type2FileNames {
+    Prefix = "/media/jhlee/SAMSUNG/jobs/21-overCPA/skfiles/mio/"
+    Separator = "-"
+    Suffix = ".skf"
+  }
+  MaxAngularMomentum {
+    O = "p"
+    H = "s"
+  }
+  SpinPolarisation = Colinear {
+  #  UnpairedElectrons = 0
+  }
+  SpinConstants = {
+    ShellResolvedSpin = Yes
+    H = { -0.072 }
+    O = { -0.035 -0.030 -0.030 -0.028 }
+  }
+  DeltaSCF = {
+    ShiftEnergy = 10.0
+    UseIMOM = Yes
+    UseMixer = No
+    ExcitedFrom_alpha = {4}
+    ExcitedTo_alpha   = {5}
+  }
+}
+Options {
+  WriteAutotestTag  = No
+  WriteDetailedXML  = Yes   # produces detailed.xml (input for waveplot)
+}
+Analysis {
+  MullikenAnalysis  = Yes
+  WriteEigenvectors = Yes   # produces eigenvec.bin (input for waveplot)
+}
+ParserOptions {
+  ParserVersion = 14
+}
