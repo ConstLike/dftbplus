@@ -88,6 +88,9 @@ module dftbp_dftbplus_mainio
   public :: writeCurrentGeometry, writeFinalDriverStatus
   public :: writeHSAndStop, writeHS
   public :: printSccHeader, printElecConstrHeader
+  public :: writeSoscfHeader, writeSoscfIter, writeSoscfRotDiag, writeSoscfPostRotDiag
+  public :: writeSoscfMomDiag
+  public :: printSoscfHeader, printSoscfInfo
   public :: printGeoStepInfo, printSccInfo, printElecConstrInfo, printEnergies, printVolume
   public :: printPressureAndFreeEnergy, printMaxForce, printMaxLatticeForce
   public :: printForceNorm, printLatticeForceNorm
@@ -4546,6 +4549,397 @@ contains
     end if
 
   end subroutine printSccInfo
+
+
+  !> Header for the SOSCF outer loop (5 columns; adds max|g|).
+  subroutine printSoscfHeader()
+
+    write(stdOut, "(A5, A18, A18, A18, A18)") "iSCC", " Total electronic ", &
+        & "  Diff electronic ", "     SCC error    ", "      max|g|      "
+
+  end subroutine printSoscfHeader
+
+
+  !> Prints info about SOSCF outer-loop convergence.
+  !! sccErrorQ = max|qOut - qIn|   (charge residual, compared against OuterSCCTolerance)
+  !! maxG      = max orbital gradient (compared against SOSCF Threshold)
+  subroutine printSoscfInfo(iSccIter, Eelec, diffElec, sccErrorQ, maxG)
+
+    integer,  intent(in) :: iSccIter
+    real(dp), intent(in) :: Eelec, diffElec, sccErrorQ, maxG
+
+    write(stdOut, "(I5,E18.8,E18.8,E18.8,E18.8)") iSccIter, Eelec, diffElec, sccErrorQ, maxG
+
+  end subroutine printSoscfInfo
+
+
+  !> Create (or overwrite) soscf.out and write the column header.
+  !!
+  !! Call once at the start of the pre-SOSCF Delta-SCF loop.
+  subroutine writeSoscfHeader(fileName, nSpin)
+
+    !> Output file name (typically soscfOut from outputfiles)
+    character(len=*), intent(in) :: fileName
+
+    !> Number of spin channels
+    integer, intent(in) :: nSpin
+
+    type(TFileDescr) :: fd
+    integer :: iSpin
+
+    call openFile(fd, fileName, mode="w")
+    write(fd%unit, "(A10, A18, A18, A18)", advance='no') &
+        & "# Iter    ", " Total electronic ", "  Diff electronic ", "     SCC error    "
+    do iSpin = 1, nSpin
+      if (nSpin == 1) then
+        write(fd%unit, "(A18)", advance='no') "     max|g|       "
+      else
+        write(fd%unit, "(A12,I2,A4)", advance='no') "   max|g|(sp", iSpin, ")  "
+      end if
+    end do
+    write(fd%unit, *)
+    call closeFile(fd)
+
+  end subroutine writeSoscfHeader
+
+
+  !> Append one iteration's data to soscf.out:
+  !!   - one summary line with iIter, energy, diff, SCC error, max|g| per spin
+  !!   - for each spin: orbital index, occ/virt label, eigenvalue, eigenvector coefficients
+  subroutine writeSoscfIter(fileName, iIter, Eelec, diffElec, sccErrorQ, maxG, &
+      & eigen, filling, eigvecs, nOrb, nSpin, iterLabel)
+
+    !> Output file name
+    character(len=*), intent(in) :: fileName
+
+    !> Iteration index
+    integer, intent(in) :: iIter
+
+    !> Total electronic energy (Hartree)
+    real(dp), intent(in) :: Eelec
+
+    !> Energy change from previous iteration
+    real(dp), intent(in) :: diffElec
+
+    !> Maximum SCC charge error
+    real(dp), intent(in) :: sccErrorQ
+
+    !> Maximum orbital gradient per spin channel, length nSpin
+    real(dp), intent(in) :: maxG(:)
+
+    !> Eigenvalues (nOrb, 1, nSpin)
+    real(dp), intent(in) :: eigen(:,:,:)
+
+    !> Filling (nOrb, 1, nSpin)
+    real(dp), intent(in) :: filling(:,:,:)
+
+    !> Eigenvectors (nOrb, nOrb, nSpin); column j = j-th MO in AO basis
+    real(dp), intent(in) :: eigvecs(:,:,:)
+
+    !> Number of orbitals
+    integer, intent(in) :: nOrb
+
+    !> Number of spin channels
+    integer, intent(in) :: nSpin
+
+    !> Short label for iteration type ("pre-SOSCF" or "SOSCF")
+    character(len=*), intent(in) :: iterLabel
+
+    type(TFileDescr) :: fd
+    integer :: iSpin, iOrb, jOrb
+    character(len=4) :: occLabel
+
+    call openFile(fd, fileName, mode="a")
+
+    ! Summary line
+    write(fd%unit, "(A10, I8, E18.8, E18.8, E18.8)", advance='no') &
+        & trim(iterLabel), iIter, Eelec, diffElec, sccErrorQ
+    do iSpin = 1, nSpin
+      write(fd%unit, "(E18.8)", advance='no') maxG(iSpin)
+    end do
+    write(fd%unit, *)
+
+    ! Per-spin eigenvalue / eigenvector table
+    do iSpin = 1, nSpin
+      if (nSpin > 1) write(fd%unit, "(2X, 'Spin ', I0, ':')") iSpin
+      write(fd%unit, "(4X, A5, A6, A20, A)") &
+          & "Orb", "  Occ", "    Eigenvalue (H)  ", "  Eigenvector coefficients"
+      do iOrb = 1, nOrb
+        if (filling(iOrb, 1, iSpin) > 0.5_dp) then
+          occLabel = "occ"
+        else
+          occLabel = "virt"
+        end if
+        write(fd%unit, "(4X, I5, A6, F20.10)", advance='no') &
+            & iOrb, trim(occLabel), eigen(iOrb, 1, iSpin)
+        do jOrb = 1, nOrb
+          write(fd%unit, "(F12.7)", advance='no') eigvecs(jOrb, iOrb, iSpin)
+        end do
+        write(fd%unit, *)
+      end do
+    end do
+    write(fd%unit, *)   ! blank line between iterations
+
+    call closeFile(fd)
+
+  end subroutine writeSoscfIter
+
+
+  !> Append rotation-step diagnostics for one spin channel to soscf.out.
+  !!
+  !! Written just BEFORE the Cayley rotation in step 2.2.  Contains:
+  !!   - per-pair orbital gradient g_ia, invHess diagonal H_ia,ia, Newton step Dx_ia
+  !!   - orbital gradient g as a 2D matrix (rows = occ orbitals, cols = virt orbitals)
+  !!   - L-SR1 key quantities: ||delta||, ||gamma||, denominator, whether update applied
+  !!   - max |kappa| element (rotation-angle magnitude indicator)
+  !!   - kappa_ia occ-virt block as nOcc x nVirt matrix (= Dx reshaped)
+  !!   - eigenvectors BEFORE rotation (from inner-loop diagonalization)
+  subroutine writeSoscfRotDiag(fileName, iOuterIter, iSpin, nOcc, nVirt, &
+      & occIdx, virtIdx, eigen, g, invHessDiag, Dx, maxKappa, kappaMat, &
+      & lsr1Applied, lsr1DeltaNorm, lsr1GammaNorm, lsr1Denom, &
+      & eigvecsBeforeRot, nOrb, filling)
+
+    character(len=*), intent(in) :: fileName
+    integer, intent(in) :: iOuterIter, iSpin
+    integer, intent(in) :: nOcc, nVirt, nOrb
+    integer, intent(in) :: occIdx(:), virtIdx(:)
+    real(dp), intent(in) :: eigen(:)        ! eigenvalues for all nOrb orbitals
+    real(dp), intent(in) :: g(:)            ! orbital gradient, length nOcc*nVirt
+    real(dp), intent(in) :: invHessDiag(:)  ! diagonal of invHess, length nOcc*nVirt
+    real(dp), intent(in) :: Dx(:)           ! Newton step = kappa_ia values, length nOcc*nVirt
+    real(dp), intent(in) :: maxKappa        ! max |kappa| over the antisymmetric matrix
+    real(dp), intent(in) :: kappaMat(:,:)   ! antisymmetric kappa matrix, (nOrb, nOrb)
+    logical,  intent(in) :: lsr1Applied
+    real(dp), intent(in) :: lsr1DeltaNorm, lsr1GammaNorm, lsr1Denom
+    real(dp), intent(in) :: eigvecsBeforeRot(:,:)  ! (nOrb, nOrb)
+    real(dp), intent(in) :: filling(:)             ! IMOM occupation, length nOrb
+
+    type(TFileDescr) :: fd
+    integer :: iOcc, iVirt, k, jOrb, iRow, iCol
+
+    call openFile(fd, fileName, mode="a")
+
+    write(fd%unit, "(/, '--- SOSCF outer iter ', I0, ', spin ', I0, &
+        & ' : rotation diagnostics ---')") iOuterIter, iSpin
+
+    ! L-SR1 update report
+    if (iOuterIter > 1) then
+      write(fd%unit, "(4X, 'L-SR1: ||delta||=', ES12.4, '  ||gamma||=', ES12.4, &
+          & '  denom=', ES12.4, '  applied=', L1)") &
+          & lsr1DeltaNorm, lsr1GammaNorm, lsr1Denom, lsr1Applied
+    else
+      write(fd%unit, "(4X, 'L-SR1: skipped (first outer iteration)')")
+    end if
+    write(fd%unit, "(4X, 'max|kappa| = ', ES12.4, ' rad')") maxKappa
+
+    ! Per-pair gradient / step table
+    write(fd%unit, "(4X, A5, A5, A20, A20, A20, A20)") &
+        & "iOcc", "iVirt", "  eps_occ (H)       ", "  eps_virt (H)      ", &
+        & "  g_ia              ", "  Dx_ia (invH*g)    "
+    k = 0
+    do iOcc = 1, nOcc
+      do iVirt = 1, nVirt
+        k = k + 1
+        write(fd%unit, "(4X, I5, I5, 4ES20.8)") &
+            & occIdx(iOcc), virtIdx(iVirt), &
+            & eigen(occIdx(iOcc)), eigen(virtIdx(iVirt)), &
+            & g(k), Dx(k)
+      end do
+    end do
+
+    ! Gradient matrix: g_ia as nOcc x nVirt matrix (rows = occ, columns = virt)
+    write(fd%unit, "(4X, 'Orbital gradient g_ia matrix (rows = occ MO indices, cols = virt MO indices):')")
+    write(fd%unit, "(4X, 'max|g| = ', ES12.4)") maxval(abs(g(1:nOcc*nVirt)))
+    write(fd%unit, "(4X, 6X)", advance='no')
+    do iVirt = 1, nVirt
+      write(fd%unit, "(I12)", advance='no') virtIdx(iVirt)
+    end do
+    write(fd%unit, *)
+    k = 0
+    do iOcc = 1, nOcc
+      write(fd%unit, "(4X, I6)", advance='no') occIdx(iOcc)
+      do iVirt = 1, nVirt
+        k = k + 1
+        write(fd%unit, "(ES12.4)", advance='no') g(k)
+      end do
+      write(fd%unit, *)
+    end do
+
+    ! Dx (kappa-vector) occ-virt block: Dx_ia is the quasi-Newton step that feeds
+    ! buildKappa to form the antisymmetric kappa(occ,virt)=+Dx, kappa(virt,occ)=-Dx;
+    ! only the occ-virt block is printed since it contains all non-trivial information.
+    write(fd%unit, "(4X, 'Dx_ia occ-virt block (rows = occ MO indices, cols = virt MO indices):')")
+    write(fd%unit, "(4X, 'max|Dx_ia| = ', ES12.4, ' rad')") maxval(abs(Dx(1:nOcc*nVirt)))
+    write(fd%unit, "(4X, 6X)", advance='no')
+    do iVirt = 1, nVirt
+      write(fd%unit, "(I12)", advance='no') virtIdx(iVirt)
+    end do
+    write(fd%unit, *)
+    k = 0
+    do iOcc = 1, nOcc
+      write(fd%unit, "(4X, I6)", advance='no') occIdx(iOcc)
+      do iVirt = 1, nVirt
+        k = k + 1
+        write(fd%unit, "(ES12.4)", advance='no') Dx(k)
+      end do
+      write(fd%unit, *)
+    end do
+
+    ! Full antisymmetric kappa matrix (nOrb x nOrb): kappa = buildKappa(Dx).
+    ! This is the actual rotation generator that feeds U = exp(kappa).
+    ! Block structure (with occ rows/cols and virt rows/cols labelled):
+    !   kappa(occ , virt) = +Dx_ia
+    !   kappa(virt, occ ) = -Dx_ia
+    !   all other elements = 0
+    write(fd%unit, "(4X, 'Antisymmetric kappa matrix (nOrb x nOrb, fed to exp(K)):')")
+    write(fd%unit, "(4X, 'max|kappa| = ', ES12.4, ' rad')") maxKappa
+    write(fd%unit, "(4X, 6X)", advance='no')
+    do iCol = 1, nOrb
+      write(fd%unit, "(I12)", advance='no') iCol
+    end do
+    write(fd%unit, *)
+    do iRow = 1, nOrb
+      write(fd%unit, "(4X, I6)", advance='no') iRow
+      do iCol = 1, nOrb
+        write(fd%unit, "(ES12.4)", advance='no') kappaMat(iRow, iCol)
+      end do
+      write(fd%unit, *)
+    end do
+
+    ! Eigenvectors before rotation with IMOM occupation
+    write(fd%unit, "(4X, 'Eigenvectors BEFORE rotation (from inner-loop diagonalization):')")
+    write(fd%unit, "(4X, A5, A20, A8, A)") "Orb", "  Eigenvalue (H)    ", "  Occ  ", "  Coefficients"
+    do iOcc = 1, nOrb
+      write(fd%unit, "(4X, I5, F20.10, F8.4)", advance='no') iOcc, eigen(iOcc), filling(iOcc)
+      do jOrb = 1, nOrb
+        write(fd%unit, "(F12.7)", advance='no') eigvecsBeforeRot(jOrb, iOcc)
+      end do
+      write(fd%unit, *)
+    end do
+
+    call closeFile(fd)
+
+  end subroutine writeSoscfRotDiag
+
+
+  !> Append post-rotation eigenvector diagnostics for one spin channel to soscf.out.
+  !!
+  !! Written just AFTER the Cayley rotation and the subsequent IMOM update.
+  !! Shows the rotated eigenvectors (Cnew = Cold * U) with IMOM-assigned occupation.
+  subroutine writeSoscfPostRotDiag(fileName, iOuterIter, iSpin, eigen, &
+      & eigvecsAfterRot, filling, nOrb)
+
+    character(len=*), intent(in) :: fileName
+    integer, intent(in) :: iOuterIter, iSpin, nOrb
+    real(dp), intent(in) :: eigen(:)             ! eigenvalues from last diagonalization
+    real(dp), intent(in) :: eigvecsAfterRot(:,:) ! rotated eigenvectors (nOrb, nOrb)
+    real(dp), intent(in) :: filling(:)           ! IMOM occupation after rotation, length nOrb
+
+    type(TFileDescr) :: fd
+    integer :: iOrb, jOrb
+
+    call openFile(fd, fileName, mode="a")
+
+    write(fd%unit, "(4X, 'Eigenvectors AFTER rotation (Cnew = Cold * U, IMOM occupation):')")
+    write(fd%unit, "(4X, A5, A20, A8, A)") "Orb", "  Eigenvalue (H)    ", "  Occ  ", "  Coefficients"
+    do iOrb = 1, nOrb
+      write(fd%unit, "(4X, I5, F20.10, F8.4)", advance='no') iOrb, eigen(iOrb), filling(iOrb)
+      do jOrb = 1, nOrb
+        write(fd%unit, "(F12.7)", advance='no') eigvecsAfterRot(jOrb, iOrb)
+      end do
+      write(fd%unit, *)
+    end do
+
+    call closeFile(fd)
+
+  end subroutine writeSoscfPostRotDiag
+
+
+  !> Append MOM (IMOM) diagnostics around a getIMOMTargetFilling call.
+  !!
+  !! Writes filling and eigenvectors before and after the MOM assignment.
+  !! MOM updates only the filling, so `eigvecsOld` and `eigvecsNew` are the
+  !! two sets that MOM compares (reference vs. newly diagonalized/rotated).
+  subroutine writeSoscfMomDiag(fileName, label, iIter, iSpin, eigvecsOld, eigvecsNew, &
+      & fillingBefore, fillingAfter, nOrb)
+
+    !> Output file name
+    character(len=*), intent(in) :: fileName
+
+    !> Short label identifying the MOM call site (e.g. "inner-SCC", "post-rotation")
+    character(len=*), intent(in) :: label
+
+    !> Iteration index (inner or outer, depending on call site)
+    integer, intent(in) :: iIter
+
+    !> Spin channel
+    integer, intent(in) :: iSpin
+
+    !> Reference ("old") eigenvectors fed to MOM, (nOrb, nOrb)
+    real(dp), intent(in) :: eigvecsOld(:,:)
+
+    !> Candidate ("new") eigenvectors fed to MOM, (nOrb, nOrb)
+    real(dp), intent(in) :: eigvecsNew(:,:)
+
+    !> Filling vector before MOM is called, length nOrb
+    real(dp), intent(in) :: fillingBefore(:)
+
+    !> Filling vector after MOM is called, length nOrb
+    real(dp), intent(in) :: fillingAfter(:)
+
+    !> Number of orbitals
+    integer, intent(in) :: nOrb
+
+    type(TFileDescr) :: fd
+    integer :: iOrb, jOrb, iDash
+    character(len=8) :: method  ! "IMOM" or "MOM", parsed from label prefix
+
+    ! Derive the method token from the label (labels are "IMOM-..." or "MOM-...")
+    iDash = index(label, "-")
+    if (iDash > 1) then
+      method = label(1:iDash-1)
+    else
+      method = "MOM"
+    end if
+
+    call openFile(fd, fileName, mode="a")
+
+    write(fd%unit, "(/, '=== ', A, ' diagnostics [', A, '] outer/inner iter ', I0, &
+        & ', spin ', I0, ' ===')") trim(method), trim(label), iIter, iSpin
+
+    write(fd%unit, "(4X, 'Filling BEFORE ', A, ':')") trim(method)
+    do iOrb = 1, nOrb
+      write(fd%unit, "(F8.4)", advance='no') fillingBefore(iOrb)
+    end do
+    write(fd%unit, *)
+
+    write(fd%unit, "(4X, 'Filling AFTER  ', A, ':')") trim(method)
+    do iOrb = 1, nOrb
+      write(fd%unit, "(F8.4)", advance='no') fillingAfter(iOrb)
+    end do
+    write(fd%unit, *)
+
+    write(fd%unit, "(4X, 'Eigenvectors OLD (reference passed to ', A, '):')") trim(method)
+    do iOrb = 1, nOrb
+      write(fd%unit, "(4X, I5)", advance='no') iOrb
+      do jOrb = 1, nOrb
+        write(fd%unit, "(F12.7)", advance='no') eigvecsOld(jOrb, iOrb)
+      end do
+      write(fd%unit, *)
+    end do
+
+    write(fd%unit, "(4X, 'Eigenvectors NEW (candidate passed to ', A, '):')") trim(method)
+    do iOrb = 1, nOrb
+      write(fd%unit, "(4X, I5)", advance='no') iOrb
+      do jOrb = 1, nOrb
+        write(fd%unit, "(F12.7)", advance='no') eigvecsNew(jOrb, iOrb)
+      end do
+      write(fd%unit, *)
+    end do
+
+    call closeFile(fd)
+
+  end subroutine writeSoscfMomDiag
 
 
   !> Prints info about electronic constraint convergence.

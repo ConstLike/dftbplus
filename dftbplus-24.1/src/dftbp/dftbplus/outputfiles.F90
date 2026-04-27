@@ -54,4 +54,7 @@ module dftbp_dftbplus_outputfiles
   !> file name for shift data
   character(*), parameter :: fShifts = "shifts.dat"
 
+  !> Verbose SOSCF diagnostic output (max|g| per spin, eigenvalues, eigenvectors)
+  character(*), parameter :: soscfOut = "soscf.out"
+
 end module dftbp_dftbplus_outputfiles
