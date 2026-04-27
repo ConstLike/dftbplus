@@ -54,6 +54,7 @@ module dftbp_dftbplus_initprogram
   use dftbp_dftb_repulsive_repulsivelist, only : TRepulsiveList
   use dftbp_dftb_repulsive_twobodyrep, only : TTwoBodyRepInp, TTwoBodyRep, TTwoBodyRep_init
   use dftbp_dftb_scc, only : TSccInput, TScc, TScc_init
+  use dftbp_dftb_soscf, only : TSoscf
   use dftbp_dftb_sccinit, only : initQFromFile, initQFromUsrChrg, initQFromAtomChrg,&
       & initQFromShellChrg
   use dftbp_dftb_shortgamma, only : TShortGammaInput, TShortGammaDamp
@@ -232,6 +233,82 @@ module dftbp_dftbplus_initprogram
 
     !> Tolerance for SCC cycle
     real(dp) :: sccTol
+
+    ! --- DeltaSCF (level-shifting) settings ---
+
+    !> Enable Delta-SCF loop
+    logical :: tDeltaScf = .false.
+
+    !> Use fixed level-shift energy (True) or adaptive based on HOMO-LUMO gap (False)
+    logical :: deltaScfIsFixedEta = .false.
+
+    !> Fixed level-shift energy eta (Hartree)
+    real(dp) :: deltaScfShiftEnergy = 0.0_dp
+
+    !> Margin for adaptive eta: eta = |HOMO-LUMO gap| + margin
+    real(dp) :: deltaScfShiftMargin = 0.1_dp
+
+    !> Pass charges through standard mixer during Delta-SCF loop
+    logical :: deltaScfUseMixer = .false.
+
+    !> Use IMOM orbital tracking
+    logical :: deltaScfUseIMOM = .true.
+
+    !> Alpha-spin orbital indices to vacate
+    integer, allocatable :: deltaScfExcitedFrom_alpha(:)
+
+    !> Alpha-spin orbital indices to fill
+    integer, allocatable :: deltaScfExcitedTo_alpha(:)
+
+    !> Beta-spin orbital indices to vacate
+    integer, allocatable :: deltaScfExcitedFrom_beta(:)
+
+    !> Beta-spin orbital indices to fill
+    integer, allocatable :: deltaScfExcitedTo_beta(:)
+
+    ! --- End DeltaSCF settings ---
+
+    ! --- SOSCF (Second-Order SCF, orbital rotation) settings ---
+
+    !> Enable SOSCF loop (runs after Delta-SCF pre-convergence phase)
+    logical :: tSoscf = .false.
+
+    !> Orbital gradient threshold: pre-SOSCF runs until max|g| < this value
+    real(dp) :: soscfThreshold = 1.0e-4_dp
+
+    !> SCC charge tolerance for the SOSCF outer convergence check.
+    real(dp) :: soscfOuterSccTol = 1.0e-8_dp
+
+    !> Verbose SOSCF output: print max|g| per spin in pre-SOSCF loop and
+    !! occ/virt eigenvalues + eigenvector coefficients at every SCF cycle.
+    logical :: soscfVerbose = .false.
+
+    !> Use Broyden/DIIS mixer in the SOSCF outer loop (.true.) or
+    !! use direct substitution (.false., default).
+    logical :: soscfUseMixer = .false.
+
+    !> Trust-region clip on the orbital rotation step (.true., default).
+    logical :: soscfUseMaxKappa = .true.
+
+    !> Trust-region cap on max|Dx| in radians (default 0.5 rad).
+    real(dp) :: soscfMaxKappa = 0.5_dp
+
+    !> SOSCF state object (allocated when tSoscf=.true.)
+    type(TSoscf) :: soscf
+
+    !> Alpha-spin orbital indices to vacate (same convention as DeltaSCF)
+    integer, allocatable :: soscfExcitedFrom_alpha(:)
+
+    !> Alpha-spin orbital indices to fill
+    integer, allocatable :: soscfExcitedTo_alpha(:)
+
+    !> Beta-spin orbital indices to vacate (optional)
+    integer, allocatable :: soscfExcitedFrom_beta(:)
+
+    !> Beta-spin orbital indices to fill (optional)
+    integer, allocatable :: soscfExcitedTo_beta(:)
+
+    ! --- End SOSCF settings ---
 
     !> Lattice vectors as columns
     real(dp), allocatable :: latVec(:,:)
@@ -1469,6 +1546,50 @@ contains
     call TParallelKS_init(this%parallelKS, env, this%nKPoint, nIndepHam)
 
     this%sccTol = input%ctrl%sccTol
+
+    ! --- DeltaSCF initialization ---
+    this%tDeltaScf = input%ctrl%tDeltaScf
+    if (this%tDeltaScf) then
+      this%deltaScfIsFixedEta  = input%ctrl%deltaScfIsFixedEta
+      this%deltaScfShiftEnergy = input%ctrl%deltaScfShiftEnergy
+      this%deltaScfShiftMargin = input%ctrl%deltaScfShiftMargin
+      this%deltaScfUseMixer    = input%ctrl%deltaScfUseMixer
+      this%deltaScfUseIMOM     = input%ctrl%deltaScfUseIMOM
+      allocate(this%deltaScfExcitedFrom_alpha(size(input%ctrl%deltaScfExcitedFrom_alpha)))
+      this%deltaScfExcitedFrom_alpha = input%ctrl%deltaScfExcitedFrom_alpha
+      allocate(this%deltaScfExcitedTo_alpha(size(input%ctrl%deltaScfExcitedTo_alpha)))
+      this%deltaScfExcitedTo_alpha   = input%ctrl%deltaScfExcitedTo_alpha
+      if (allocated(input%ctrl%deltaScfExcitedFrom_beta)) then
+        allocate(this%deltaScfExcitedFrom_beta(size(input%ctrl%deltaScfExcitedFrom_beta)))
+        this%deltaScfExcitedFrom_beta = input%ctrl%deltaScfExcitedFrom_beta
+        allocate(this%deltaScfExcitedTo_beta(size(input%ctrl%deltaScfExcitedTo_beta)))
+        this%deltaScfExcitedTo_beta   = input%ctrl%deltaScfExcitedTo_beta
+      end if
+    end if
+    ! --- End DeltaSCF initialization ---
+
+    ! --- SOSCF initialization ---
+    this%tSoscf = input%ctrl%tSoscf
+    if (this%tSoscf) then
+      this%soscfThreshold   = input%ctrl%soscfThreshold
+      this%soscfOuterSccTol = input%ctrl%soscfOuterSccTol
+      this%soscfVerbose     = input%ctrl%soscfVerbose
+      this%soscfUseMixer    = input%ctrl%soscfUseMixer
+      this%soscfUseMaxKappa = input%ctrl%soscfUseMaxKappa
+      this%soscfMaxKappa    = input%ctrl%soscfMaxKappa
+      allocate(this%soscfExcitedFrom_alpha(size(input%ctrl%soscfExcitedFrom_alpha)))
+      this%soscfExcitedFrom_alpha = input%ctrl%soscfExcitedFrom_alpha
+      allocate(this%soscfExcitedTo_alpha(size(input%ctrl%soscfExcitedTo_alpha)))
+      this%soscfExcitedTo_alpha   = input%ctrl%soscfExcitedTo_alpha
+      if (allocated(input%ctrl%soscfExcitedFrom_beta)) then
+        allocate(this%soscfExcitedFrom_beta(size(input%ctrl%soscfExcitedFrom_beta)))
+        this%soscfExcitedFrom_beta = input%ctrl%soscfExcitedFrom_beta
+        allocate(this%soscfExcitedTo_beta(size(input%ctrl%soscfExcitedTo_beta)))
+        this%soscfExcitedTo_beta   = input%ctrl%soscfExcitedTo_beta
+      end if
+    end if
+    ! --- End SOSCF initialization ---
+
     this%tShowFoldedCoord = input%ctrl%tShowFoldedCoord
     if (this%tShowFoldedCoord .and. .not. (this%tPeriodic .or. this%tHelical)) then
       call error("Folding coordinates back into the central cell is meaningless for molecular&
