@@ -1,0 +1,49 @@
+Geometry = xyzFormat {
+  <<< "benzene.xyz"
+}
+Hamiltonian = DFTB {
+  SCC = Yes
+  SCCTolerance = 1e-7
+  MaxSCCIterations = 200
+  SlaterKosterFiles = Type2FileNames {
+    Prefix = "@SKDIR@/"
+    Separator = "-"
+    Suffix = ".skf"
+  }
+  MaxAngularMomentum {
+    C = "p"
+    H = "s"
+  }
+  SpinPolarisation = Colinear {}
+  SpinConstants = {
+    ShellResolvedSpin = Yes
+    C = { -0.031 -0.025 -0.025 -0.023 }
+    H = { -0.072 }
+  }
+  DeltaSCF = {
+    ShiftEnergy        = 10.0
+    UseIMOM            = Yes
+    UseMixer           = Yes
+    ExcitedFrom_alpha  = { 15 }
+    ExcitedTo_alpha    = { 16 }
+  }
+  SOSCF = {
+    Threshold          = 1e-1
+    OuterSCCTolerance  = 1e-7
+    UseMixer           = No
+    Verbosity          = No
+    ExcitedFrom_alpha  = { 15 }
+    ExcitedTo_alpha    = { 16 }
+  }
+}
+Options {
+  WriteAutotestTag  = Yes
+  WriteDetailedXML  = No
+}
+Analysis {
+  MullikenAnalysis  = Yes
+  WriteEigenvectors = No
+}
+ParserOptions {
+  ParserVersion = 14
+}

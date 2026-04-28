@@ -1,0 +1,10 @@
+test,total_energy_h,max_iters,character_label
+h2o/4-5,-3.4802356738,30,n_O(out-of-plane py) -> sigma*(O-H sym)
+formaldehyde/6-7,-5.6084918773,50,n_O(pz) -> pi*(C=O)
+ammonia/4-5,-2.8488746206,30,n_N(py lone pair) -> sigma*
+methanol/7-8,-5.9604518449,55,n_O(out-of-plane py) -> sigma*(C-framework)
+acetylene/5-6,-3.7947692868,15,pi -> pi* (degenerate frontier)
+ethylene/6-7,-4.6798020899,15,pi -> pi*
+benzene/15-16,-12.3733604019,30,pi(e1g) -> pi*(e2u) single-orbital
+"benzene/14,15-16,17",-12.1787840516,40,pi -> pi* averaged 4-orbital manifold
+pyridine/15-16,-12.6610468659,80,n_N(in-plane sp-hybrid) -> pi*

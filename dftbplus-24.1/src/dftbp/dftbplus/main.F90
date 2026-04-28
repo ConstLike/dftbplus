@@ -8404,10 +8404,10 @@ contains
     integer   :: iOuterIter, iSpin
     character(len=80) :: msgTmp
 
-    ! Per-spin SOSCF working arrays
-    real(dp), allocatable :: g(:)          ! orbital gradient (nOccVirt)
-    real(dp), allocatable :: Dx(:)         ! quasi-Newton step (nOccVirt)
-    real(dp), allocatable :: gammaSoscf(:) ! L-SR1 gradient change
+    ! SOSCF working arrays, stacked over both spin channels (length nTot)
+    real(dp), allocatable :: g(:)          ! orbital gradient (nTot)
+    real(dp), allocatable :: Dx(:)         ! quasi-Newton step (nTot)
+    real(dp), allocatable :: gammaSoscf(:) ! L-SR1 gradient change (nTot)
     real(dp), allocatable :: kappa(:,:)    ! antisymmetric rotation matrix (nOrb, nOrb)
     real(dp), allocatable :: Urot(:,:)     ! Cayley rotation matrix (nOrb, nOrb)
     real(dp), allocatable :: Cnew(:,:)     ! rotated eigenvectors (nOrb, nOrb)
@@ -8415,7 +8415,9 @@ contains
     real(dp), allocatable :: HphysReal(:,:)! physical (unshifted) dense H (nOrb, nOrb)
     real(dp), allocatable :: qDiffRed(:)   ! charge residual for Broyden mixing
 
-    integer :: nOccSpin, nVirtSpin
+    integer :: nOccSpin, nVirtSpin, off, n
+    real(dp) :: lsr1DN, lsr1GN, lsr1Denom
+    logical  :: lsr1Applied
 
     ! -----------------------------------------------------------------
     ! Setup: build targetFilling, init SOSCF state, save reference eigvecs
@@ -8501,13 +8503,18 @@ contains
       call convertToUpDownRepr(this%ints%hamiltonian, this%ints%iHamiltonian)
 
       maxG_step22 = 0.0_dp    ! reset: accumulate max|g| across spins before rotation
+
+      allocate(g (this%soscf%nTot))
+      allocate(Dx(this%soscf%nTot))
+      allocate(gammaSoscf(this%soscf%nTot))
+
+      ! Assemble the orbital gradient over both spin channels into the
+      ! stacked vector g; max|g| accumulates for outer convergence.
       do iSpin = 1, this%nSpin
         nOccSpin  = this%soscf%spin(iSpin)%nOcc
         nVirtSpin = this%soscf%spin(iSpin)%nVirt
-
-        allocate(g(nOccSpin * nVirtSpin))
-        allocate(Dx(nOccSpin * nVirtSpin))
-        allocate(gammaSoscf(nOccSpin * nVirtSpin))
+        off = this%soscf%spin(iSpin)%offset
+        n   = this%soscf%spin(iSpin)%nOccVirt
 
         ! Unpack physical H and compute orbital gradient
         call unpackHS(HphysReal, this%ints%hamiltonian(:, iSpin), &
@@ -8516,57 +8523,60 @@ contains
         call symmetrizeHS(HphysReal)
         call computeOrbGradient(this%eigvecsReal(:,:,iSpin), HphysReal, &
             & this%nOrb, this%soscf%spin(iSpin)%occIdx, this%soscf%spin(iSpin)%virtIdx, &
-            & nOccSpin, nVirtSpin, g)
+            & nOccSpin, nVirtSpin, g(off+1:off+n))
 
-        maxGPerSpinOuter(iSpin) = maxval(abs(g))
-        maxG_step22 = max(maxG_step22, maxGPerSpinOuter(iSpin))  ! accumulate for outer convergence
+        maxGPerSpinOuter(iSpin) = maxval(abs(g(off+1:off+n)))
+        maxG_step22 = max(maxG_step22, maxGPerSpinOuter(iSpin))
+      end do
 
-        ! L-SR1 update (correct secant-pair timing).
-        ! Skipped at the first outer iteration (no prior step).
-        block
-          real(dp) :: lsr1DN, lsr1GN, lsr1Denom
-          logical  :: lsr1Applied
-          lsr1DN = 0.0_dp; lsr1GN = 0.0_dp; lsr1Denom = 0.0_dp; lsr1Applied = .false.
-          if (iOuterIter > 1) then
-            gammaSoscf(:) = g(:) - this%soscf%spin(iSpin)%gPrev(:)
-            call updateInvHessianLSR1(this%soscf%spin(iSpin), &
-                & this%soscf%spin(iSpin)%DxPrev, gammaSoscf, &
-                & lsr1DN, lsr1GN, lsr1Denom, lsr1Applied)
-          end if
-          this%soscf%spin(iSpin)%gPrev(:) = g(:)
+      ! L-SR1 update (correct secant-pair timing).
+      ! Skipped at the first outer iteration (no prior step).
+      lsr1DN = 0.0_dp; lsr1GN = 0.0_dp; lsr1Denom = 0.0_dp; lsr1Applied = .false.
+      if (iOuterIter > 1) then
+        gammaSoscf(:) = g(:) - this%soscf%gPrev(:)
+        call updateInvHessianLSR1(this%soscf, this%soscf%DxPrev, gammaSoscf, &
+            & lsr1DN, lsr1GN, lsr1Denom, lsr1Applied)
+      end if
+      this%soscf%gPrev(:) = g(:)
 
-          ! Quasi-Newton step with the now-updated inverse Hessian: Δx = -G_n * g
-          ! (trust-region clip applied inside if soscfUseMaxKappa = .true.)
-          call getSoscfStep(this%soscf, this%soscf%spin(iSpin), g, Dx)
+      ! Quasi-Newton step with the now-updated inverse Hessian: Δx = -G_n * g
+      ! (trust-region clip applied inside if soscfUseMaxKappa = .true.)
+      call getSoscfStep(this%soscf, g, Dx)
 
-          ! Store Dx for use as delta in next outer iteration's L-SR1 update
-          this%soscf%spin(iSpin)%DxPrev(:) = Dx(:)
+      ! Store Dx for use as delta in next outer iteration's L-SR1 update
+      this%soscf%DxPrev(:) = Dx(:)
 
-          ! Build kappa from step Dx and compute Cayley rotation U
-          call buildKappa(Dx, &
-              & this%soscf%spin(iSpin)%occIdx, this%soscf%spin(iSpin)%virtIdx, &
-              & nOccSpin, nVirtSpin, this%nOrb, kappa)
-          call computeCayleyExp(kappa, this%nOrb, Urot)
+      do iSpin = 1, this%nSpin
+        nOccSpin  = this%soscf%spin(iSpin)%nOcc
+        nVirtSpin = this%soscf%spin(iSpin)%nVirt
+        off = this%soscf%spin(iSpin)%offset
+        n   = this%soscf%spin(iSpin)%nOccVirt
 
-          ! Save C_old before rotation (required for IMOM reference and diagnostics)
-          allocate(Cold(this%nOrb, this%nOrb, 1))
-          Cold(:,:,1) = this%eigvecsReal(:,:,iSpin)
+        ! Build kappa from step Dx and compute Cayley rotation U
+        call buildKappa(Dx(off+1:off+n), &
+            & this%soscf%spin(iSpin)%occIdx, this%soscf%spin(iSpin)%virtIdx, &
+            & nOccSpin, nVirtSpin, this%nOrb, kappa)
+        call computeCayleyExp(kappa, this%nOrb, Urot)
 
-          ! Write rotation diagnostics to soscf.out BEFORE applying the rotation
-          if (this%soscfVerbose) then
-            block
-              real(dp), allocatable :: invHDiag(:)
-              allocate(invHDiag(nOccSpin * nVirtSpin))
-              call getInvHessDiag(this%soscf%spin(iSpin), invHDiag)
-              call writeSoscfRotDiag(soscfOut, iOuterIter, iSpin, nOccSpin, nVirtSpin, &
-                  & this%soscf%spin(iSpin)%occIdx, this%soscf%spin(iSpin)%virtIdx, &
-                  & this%eigen(:, 1, iSpin), g, invHDiag, Dx, maxval(abs(kappa)), kappa, &
-                  & lsr1Applied, lsr1DN, lsr1GN, lsr1Denom, &
-                  & Cold(:,:,1), this%nOrb, targetFilling(:, 1, iSpin))
-              deallocate(invHDiag)
-            end block
-          end if
-        end block
+        ! Save C_old before rotation (required for IMOM reference and diagnostics)
+        allocate(Cold(this%nOrb, this%nOrb, 1))
+        Cold(:,:,1) = this%eigvecsReal(:,:,iSpin)
+
+        ! Write rotation diagnostics to soscf.out BEFORE applying the rotation
+        if (this%soscfVerbose) then
+          block
+            real(dp), allocatable :: invHDiag(:)
+            allocate(invHDiag(nOccSpin * nVirtSpin))
+            call getInvHessDiag(this%soscf, iSpin, invHDiag)
+            call writeSoscfRotDiag(soscfOut, iOuterIter, iSpin, nOccSpin, nVirtSpin, &
+                & this%soscf%spin(iSpin)%occIdx, this%soscf%spin(iSpin)%virtIdx, &
+                & this%eigen(:, 1, iSpin), g(off+1:off+n), invHDiag, &
+                & Dx(off+1:off+n), maxval(abs(kappa)), kappa, &
+                & lsr1Applied, lsr1DN, lsr1GN, lsr1Denom, &
+                & Cold(:,:,1), this%nOrb, targetFilling(:, 1, iSpin))
+            deallocate(invHDiag)
+          end block
+        end if
 
         ! C_new = C_old * U  (right multiplication; MOs stored as columns)
         call gemm(Cnew, Cold(:,:,1), Urot)
@@ -8613,9 +8623,9 @@ contains
         end if
 
         deallocate(Cold)
-
-        deallocate(g, Dx, gammaSoscf)
       end do
+
+      deallocate(g, Dx, gammaSoscf)
 
       ! Advance MOM reference (MOM mode only) now that all spins have been
       ! rotated and IMOM-reassigned.  For IMOM mode the reference is the

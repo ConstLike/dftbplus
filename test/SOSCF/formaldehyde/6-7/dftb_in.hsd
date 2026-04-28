@@ -21,7 +21,7 @@ Hamiltonian = DFTB{
     O = { -0.035 -0.030 -0.030 -0.028 }
   }
   SlaterKosterFiles = Type2FileNames{
-    Prefix = '/media/jhlee/SAMSUNG/jobs/21-overCPA/skfiles/mio/'
+    Prefix = '@SKDIR@/'
     Separator = '-'
     Suffix = '.skf'
     LowerCaseTypeName = No
@@ -50,6 +50,7 @@ Analysis = {
 Options = {
   WriteDetailedOut = Yes
   WriteDetailedXML = Yes
+  WriteAutotestTag = Yes
   TimingVerbosity = -1
 }
 ParserOptions = {

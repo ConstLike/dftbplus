@@ -1,5 +1,5 @@
 Geometry = xyzFormat {
-  <<< "h2o.xyz"
+  <<< "methanol.xyz"
 }
 Hamiltonian = DFTB {
   SCC = Yes
@@ -11,38 +11,40 @@ Hamiltonian = DFTB {
     Suffix = ".skf"
   }
   MaxAngularMomentum {
+    C = "p"
     O = "p"
     H = "s"
   }
   SpinPolarisation = Colinear {}
   SpinConstants = {
     ShellResolvedSpin = Yes
-    H = { -0.072 }
+    C = { -0.031 -0.025 -0.025 -0.023 }
     O = { -0.035 -0.030 -0.030 -0.028 }
+    H = { -0.072 }
   }
   DeltaSCF = {
-    ShiftEnergy        = 10.0   
-    UseIMOM            = Yes    
-    #UseMixer           = No    
-    UseMixer           = Yes    
-    ExcitedFrom_alpha  = {4}    
-    ExcitedTo_alpha    = {5}    
+    ShiftEnergy        = 10.0
+    UseIMOM            = Yes
+    UseMixer           = Yes
+    ExcitedFrom_alpha  = { 7 }
+    ExcitedTo_alpha    = { 8 }
   }
   SOSCF = {
-    Threshold          = 1e-1   
+    Threshold          = 1e-1
     OuterSCCTolerance  = 1e-7
-    Verbosity          = Yes
-    ExcitedFrom_alpha  = {4}    
-    ExcitedTo_alpha    = {5}    
+    UseMixer           = No
+    Verbosity          = No
+    ExcitedFrom_alpha  = { 7 }
+    ExcitedTo_alpha    = { 8 }
   }
 }
 Options {
   WriteAutotestTag  = Yes
-  WriteDetailedXML  = Yes   # produces detailed.xml (input for waveplot)
+  WriteDetailedXML  = No
 }
 Analysis {
   MullikenAnalysis  = Yes
-  WriteEigenvectors = Yes   # produces eigenvec.bin (input for waveplot)
+  WriteEigenvectors = No
 }
 ParserOptions {
   ParserVersion = 14

@@ -13,7 +13,8 @@
 !!              with quasi-Newton step   Delta_x = -H * g
 !!              and L-SR1 inverse-Hessian update.
 !!
-!! Each spin channel is treated independently.
+!! The L-SR1 inverse Hessian is one matrix stacked over both spin channels,
+!! so the secant pair (delta, gamma) carries cross-spin coupling.
 module dftbp_dftb_soscf
   use dftbp_common_accuracy, only : dp
   use dftbp_math_blasroutines, only : gemm, gemv, ger
@@ -63,6 +64,10 @@ module dftbp_dftb_soscf
     integer :: nVirt = 0
     integer :: nOccVirt = 0
 
+    !> Offset of this spin's slice in the parent TSoscf stacked vectors
+    !! (this spin owns indices offset+1 .. offset+nOccVirt).
+    integer :: offset = 0
+
     !> 1-based indices of occupied orbitals in the full orbital list
     integer, allocatable :: occIdx(:)
 
@@ -72,17 +77,6 @@ module dftbp_dftb_soscf
     !> Accumulated orbital rotation vector x, length nOcc*nVirt.
     !! Ordering: x( (iOcc-1)*nVirt + iVirt ) = rotation angle for pair (iOcc, iVirt).
     real(dp), allocatable :: xVec(:)
-
-    !> Orbital gradient from the previous SOSCF iteration (for gamma = g_n - g_{n-1}).
-    real(dp), allocatable :: gPrev(:)
-
-    !> Quasi-Newton step from the previous SOSCF iteration (for delta = Dx_{n-1}).
-    !! Used as the secant displacement in the L-SR1 update at the next outer iteration.
-    real(dp), allocatable :: DxPrev(:)
-
-    !> Approximate inverse Hessian, shape (nOccVirt, nOccVirt).
-    !! Stored as a full symmetric matrix; both triangles are kept up to date.
-    real(dp), allocatable :: invHess(:,:)
 
     !> True once soscf_init has been called for this spin.
     logical :: isInitialized = .false.
@@ -95,8 +89,25 @@ module dftbp_dftb_soscf
 
     integer :: nSpin = 0
 
+    !> Total length of the stacked occ-virt parameter vector,
+    !! nTot = sum_sigma nOccVirt^sigma.
+    integer :: nTot = 0
+
     !> Per-spin data, size nSpin.
     type(TSoscfSpin), allocatable :: spin(:)
+
+    !> Orbital gradient from the previous SOSCF iteration, stacked over both
+    !! spins, length nTot (for gamma = g_n - g_{n-1}).
+    real(dp), allocatable :: gPrev(:)
+
+    !> Quasi-Newton step from the previous SOSCF iteration, stacked over both
+    !! spins, length nTot.  Used as the secant displacement delta in the
+    !! L-SR1 update at the next outer iteration.
+    real(dp), allocatable :: DxPrev(:)
+
+    !> Approximate inverse Hessian, shape (nTot, nTot).
+    !! Stored as a full symmetric matrix; both triangles are kept up to date.
+    real(dp), allocatable :: invHess(:,:)
 
     !> Gradient threshold for entering SOSCF (and for final convergence).
     real(dp) :: threshold = 1.0e-4_dp
@@ -147,7 +158,7 @@ contains
     !> Cap magnitude in radians (ignored if useMaxKappa = .false.).
     real(dp), intent(in) :: maxKappa
 
-    integer :: iSpin, iOrb, iOcc, iVirt, k
+    integer :: iSpin, iOrb, iOcc, iVirt, k, kAbs, runOffset
     integer :: nOcc, nVirt
 
     this%nSpin       = nSpin
@@ -156,23 +167,36 @@ contains
     this%maxKappa    = maxKappa
     allocate(this%spin(nSpin))
 
+    ! --- count occ/virt per spin and assign offsets into the stacked vectors -
+    runOffset = 0
     do iSpin = 1, nSpin
-
-      ! --- count occ / virt for this spin ----------------------------------
       nOcc  = count(targetFilling(:,1,iSpin) > 0.5_dp)
       nVirt = nOrb - nOcc
-
       this%spin(iSpin)%nOcc     = nOcc
       this%spin(iSpin)%nVirt    = nVirt
       this%spin(iSpin)%nOccVirt = nOcc * nVirt
+      this%spin(iSpin)%offset   = runOffset
+      runOffset = runOffset + nOcc * nVirt
+    end do
+    this%nTot = runOffset
 
-      ! --- allocate ---------------------------------------------------------
+    ! --- allocate stacked secant buffers and inverse Hessian -----------------
+    allocate(this%gPrev (this%nTot))
+    allocate(this%DxPrev(this%nTot))
+    allocate(this%invHess(this%nTot, this%nTot))
+    this%gPrev (:)    = 0.0_dp
+    this%DxPrev(:)    = 0.0_dp
+    this%invHess(:,:) = 0.0_dp
+
+    do iSpin = 1, nSpin
+
+      nOcc  = this%spin(iSpin)%nOcc
+      nVirt = this%spin(iSpin)%nVirt
+
+      ! --- allocate per-spin index lists and rotation vector ----------------
       allocate(this%spin(iSpin)%occIdx(nOcc))
       allocate(this%spin(iSpin)%virtIdx(nVirt))
       allocate(this%spin(iSpin)%xVec(nOcc * nVirt))
-      allocate(this%spin(iSpin)%gPrev(nOcc * nVirt))
-      allocate(this%spin(iSpin)%DxPrev(nOcc * nVirt))
-      allocate(this%spin(iSpin)%invHess(nOcc * nVirt, nOcc * nVirt))
 
       ! --- collect occ/virt orbital indices ---------------------------------
       iOcc = 0
@@ -187,10 +211,8 @@ contains
         end if
       end do
 
-      ! --- initialise rotation vector, gradient, and previous step ----------
-      this%spin(iSpin)%xVec(:)   = 0.0_dp
-      this%spin(iSpin)%gPrev(:)  = 0.0_dp
-      this%spin(iSpin)%DxPrev(:) = 0.0_dp
+      ! --- initialise rotation vector ---------------------------------------
+      this%spin(iSpin)%xVec(:) = 0.0_dp
 
       ! --- initialise diagonal inverse Hessian: H_ia,ia = 1/(2*(e_a - e_i)) ---
       !
@@ -212,14 +234,14 @@ contains
       !
       ! Therefore: use the SIGNED gap with a magnitude clamp to avoid division
       ! by zero at near-degenerate pairs.
-      this%spin(iSpin)%invHess(:,:) = 0.0_dp
       k = 0
       do iOcc = 1, nOcc
         do iVirt = 1, nVirt
           k = k + 1
+          kAbs = this%spin(iSpin)%offset + k
           associate( gap => eigen(this%spin(iSpin)%virtIdx(iVirt), 1, iSpin) &
               &             - eigen(this%spin(iSpin)%occIdx(iOcc),  1, iSpin) )
-            this%spin(iSpin)%invHess(k, k) = &
+            this%invHess(kAbs, kAbs) = &
                 & sign(1.0_dp, gap) / max(2.0_dp * abs(gap), 1.0e-3_dp)
           end associate
         end do
@@ -289,31 +311,27 @@ contains
   end subroutine computeOrbGradient
 
 
-  !> Compute the quasi-Newton step for one spin channel.
-  !!
-  !! Delta_x = -H * g
+  !> Compute the quasi-Newton step Delta_x = -H * g over the stacked
+  !! occ-virt vector (length nTot).
   !!
   !! Followed by an optional trust-region clip: if soscf%useMaxKappa and
   !! max|Dx| > soscf%maxKappa, Dx is rescaled so max|Dx| = soscf%maxKappa,
   !! preserving the step direction.
-  subroutine getSoscfStep(soscf, sp, g, Dx)
+  subroutine getSoscfStep(soscf, g, Dx)
 
-    !> Top-level SOSCF state (supplies useMaxKappa / maxKappa).
+    !> Top-level SOSCF state (supplies invHess and useMaxKappa / maxKappa).
     type(TSoscf), intent(in) :: soscf
 
-    !> SOSCF spin state.
-    type(TSoscfSpin), intent(in) :: sp
-
-    !> Current orbital gradient, length nOccVirt.
+    !> Current orbital gradient, length nTot.
     real(dp), intent(in) :: g(:)
 
-    !> Quasi-Newton step, length nOccVirt  (intent out).
+    !> Quasi-Newton step, length nTot.
     real(dp), intent(out) :: Dx(:)
 
     real(dp) :: maxAbsDx
 
     ! Dx = -invHess * g
-    call gemv(Dx, sp%invHess, g, alpha=-1.0_dp, beta=0.0_dp)
+    call gemv(Dx, soscf%invHess, g, alpha=-1.0_dp, beta=0.0_dp)
 
     ! Trust-region clip (optional).
     if (soscf%useMaxKappa) then
@@ -426,15 +444,15 @@ contains
   !!
   !! The update is skipped when |j^T * gamma| is below the safety threshold
   !! lsr1SkipTol * ||j|| * ||gamma|| to avoid numerical blow-up.
-  subroutine updateInvHessianLSR1(sp, delta, gamma, deltaNorm, gammaNorm, denom_out, tUpdated)
+  subroutine updateInvHessianLSR1(this, delta, gamma, deltaNorm, gammaNorm, denom_out, tUpdated)
 
-    !> SOSCF spin state (invHess updated in-place).
-    type(TSoscfSpin), intent(inout) :: sp
+    !> SOSCF state (invHess updated in-place).
+    type(TSoscf), intent(inout) :: this
 
-    !> Step taken: delta = Delta_x = x_{n+1} - x_n, length nOccVirt.
+    !> Step taken: delta = Delta_x = x_{n+1} - x_n, length nTot.
     real(dp), intent(in) :: delta(:)
 
-    !> Gradient change: gamma = g_{n+1} - g_n, length nOccVirt.
+    !> Gradient change: gamma = g_{n+1} - g_n, length nTot.
     real(dp), intent(in) :: gamma(:)
 
     !> Diagnostic: ||delta||
@@ -451,10 +469,8 @@ contains
 
     real(dp), allocatable :: jVec(:)
     real(dp) :: denom, jNorm, gNorm
-    integer :: n
 
-    n = sp%nOccVirt
-    allocate(jVec(n))
+    allocate(jVec(this%nTot))
 
     deltaNorm = sqrt(dot_product(delta, delta))
     gammaNorm = sqrt(dot_product(gamma, gamma))
@@ -471,7 +487,7 @@ contains
     end if
 
     ! j = delta - H * gamma
-    call gemv(jVec, sp%invHess, gamma, alpha=-1.0_dp, beta=0.0_dp)
+    call gemv(jVec, this%invHess, gamma, alpha=-1.0_dp, beta=0.0_dp)
     jVec(:) = delta(:) + jVec(:)    ! j = delta - H*gamma
 
     ! Denominator j^T * gamma
@@ -488,7 +504,7 @@ contains
 
     ! Rank-1 update: H += j * j^T / denom
     tUpdated = .true.
-    call ger(sp%invHess, 1.0_dp / denom, jVec, jVec)
+    call ger(this%invHess, 1.0_dp / denom, jVec, jVec)
 
     deallocate(jVec)
 
@@ -496,12 +512,14 @@ contains
 
 
   !> Return the diagonal of the inverse Hessian for one spin channel.
-  subroutine getInvHessDiag(sp, diagH)
-    type(TSoscfSpin), intent(in) :: sp
+  subroutine getInvHessDiag(this, iSpin, diagH)
+    type(TSoscf), intent(in) :: this
+    integer, intent(in) :: iSpin
     real(dp), intent(out) :: diagH(:)
-    integer :: k
-    do k = 1, sp%nOccVirt
-      diagH(k) = sp%invHess(k, k)
+    integer :: k, kAbs
+    do k = 1, this%spin(iSpin)%nOccVirt
+      kAbs = this%spin(iSpin)%offset + k
+      diagH(k) = this%invHess(kAbs, kAbs)
     end do
   end subroutine getInvHessDiag
 
