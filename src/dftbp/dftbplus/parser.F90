@@ -8437,6 +8437,12 @@ contains
 !    !> Calculate nonadiabatic coupling vectors
 !    call getChildValue(node, "NonAdiabaticCoupling", ctrl%reksInp%tNAC, default=.false.)
 
+    !> Gradient, relaxed density, NAC not yet implemented for SSR(4,4)
+    ctrl%reksInp%Glevel = 0
+    ctrl%reksInp%tRD = .false.
+    ctrl%reksInp%tNAC = .false.
+    ctrl%reksInp%tTDPgrad = .false.
+
     !> Print level in standard output file
     call getChildValue(node, "VerbosityLevel", ctrl%reksInp%Plevel, default=1)
 
